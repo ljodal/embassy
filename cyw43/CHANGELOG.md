@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Add WPA3 and WPA2/WPA3 transition-mode SoftAP support.
 - Add `bt-hci-transport` 0.1.0 support.
+- Preserve host-owned Bluetooth control bits under simultaneous WiFi and Bluetooth load.
+- Bluetooth uses interrupts instead of SPI polling
 
 ## 0.7.0 - 2026-03-10
 

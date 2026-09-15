@@ -635,7 +635,9 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
 
             BusType::Spi => {
                 // Set up the interrupt mask and enable interrupts
+                let mut interrupt_mask = IRQ_F2_PACKET_AVAILABLE;
                 if bt_fw.is_some() {
+                    interrupt_mask |= IRQ_F1_INTR;
                     debug!("bluetooth setup interrupt mask");
                     self.bus
                         .bp_write32(
@@ -646,7 +648,7 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
                 }
 
                 self.bus
-                    .write16(FUNC_BUS, REG_BUS_INTERRUPT_ENABLE, IRQ_F2_PACKET_AVAILABLE)
+                    .write16(FUNC_BUS, REG_BUS_INTERRUPT_ENABLE, interrupt_mask)
                     .await;
 
                 // "Lower F2 Watermark to avoid DMA Hang in F2 when SD Clock is stopped."
@@ -767,12 +769,6 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
                 #[cfg(not(feature = "bluetooth"))]
                 let bt_tx = core::future::pending::<()>();
 
-                // interrupts aren't working yet for bluetooth. Do busy-polling instead.
-                // Note for this to work `ev` has to go last in the `select()`. It prefers
-                // first futures if they're ready, so other select branches don't get starved.`
-                #[cfg(feature = "bluetooth")]
-                let ev = core::future::ready(());
-                #[cfg(not(feature = "bluetooth"))]
                 let ev = self.bus.wait_for_event();
 
                 match select4(ioctl, wifi_tx, bt_tx, ev).await {
@@ -845,13 +841,6 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
                     }
                     Either4::Fourth(()) => {
                         self.handle_irq(&mut buf).await;
-
-                        // If we do busy-polling, make sure to yield.
-                        // `handle_irq` will only do a 32bit read if there's no work to do, which is really fast.
-                        // Depending on optimization level, it is possible that the 32-bit read finishes on
-                        // first poll, so it never yields and we starve all other tasks.
-                        #[cfg(feature = "bluetooth")]
-                        embassy_futures::yield_now().await;
                     }
                 }
             } else {
