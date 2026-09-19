@@ -15,7 +15,7 @@ use embedded_io_async::ErrorKind;
 use crate::consts::*;
 use crate::runner::Bus;
 pub use crate::spi::SpiBusCyw43;
-use crate::util::round_up;
+use crate::util::{Throttle, round_up};
 use crate::{ChipInfo, Cyw43439, SealedChip, util};
 
 const CHIP: ChipInfo = Cyw43439::INFO;
@@ -56,6 +56,9 @@ pub(crate) struct BtRunner<'d> {
     h2b_write_pointer: u32,
     b2h_read_pointer: u32,
     host_ctrl: HostCtrl,
+
+    short_packet: Throttle,
+    bad_pointer: Throttle,
 }
 
 /// Host-owned BTSDIO control bits.
@@ -142,6 +145,8 @@ pub(crate) fn new<'d>(state: &'d mut BtState) -> (BtRunner<'d>, BtDriver<'d>) {
             h2b_write_pointer: 0,
             b2h_read_pointer: 0,
             host_ctrl: HostCtrl::new(),
+            short_packet: Throttle::new(),
+            bad_pointer: Throttle::new(),
         },
         BtDriver {
             rx: RefCell::new(rx_receiver),
@@ -403,7 +408,11 @@ impl<'a> BtRunner<'a> {
         // contents the firmware has not consumed yet. Drop the turn rather than
         // act on it; the packet stays queued and the next attempt re-reads.
         if read_pointer >= BTSDIO_FWBUF_SIZE {
-            warn!("host2bt read pointer out of range: {:08x}", read_pointer);
+            if let Some(n) = self.bad_pointer.admit() {
+                warn!("host2bt read pointer out of range (x{})", n);
+                let at = self.addr + BTSDIO_OFFSET_HOST2BT_OUT;
+                self.diagnose_backplane(bus, "host2bt_out", at, read_pointer).await;
+            }
             yield_now().await;
             return;
         }
@@ -456,6 +465,48 @@ impl<'a> BtRunner<'a> {
         msg.receive_done();
     }
 
+    /// Report a backplane read that came back as nonsense, and try to find out why.
+    ///
+    /// `backplane_set_window` writes only the address bytes that differ from its
+    /// own cache, so if one of those writes is lost the chip's window register
+    /// and the driver's idea of it diverge — and nothing ever rewrites them.
+    /// Every later backplane access then computes a correct offset into the
+    /// wrong window, which is exactly what a nonsense ring pointer looks like.
+    /// (The C driver does not have this failure mode: it restores the window to
+    /// a fixed base after every access, so all three bytes are rewritten
+    /// constantly and a lost write is corrected by the next transaction.)
+    ///
+    /// So: read the window registers back off the chip and say whether they
+    /// agree with the cache, then force a full rewrite and read the same
+    /// address again. If the second read is sane, the window was the problem.
+    async fn diagnose_backplane(&mut self, bus: &mut impl Bus, what: &str, addr: u32, got: u32) {
+        let cached = bus.backplane_window_cached();
+
+        let hi = bus.read8(FUNC_BACKPLANE, REG_BACKPLANE_BACKPLANE_ADDRESS_HIGH).await;
+        let mid = bus.read8(FUNC_BACKPLANE, REG_BACKPLANE_BACKPLANE_ADDRESS_MID).await;
+        let lo = bus.read8(FUNC_BACKPLANE, REG_BACKPLANE_BACKPLANE_ADDRESS_LOW).await;
+        let actual = ((hi as u32) << 24) | ((mid as u32) << 16) | ((lo as u32) << 8);
+
+        if actual == cached {
+            warn!(
+                "{}: {:08x} read {:08x}; backplane window agrees (cached and chip both {:08x})",
+                what, addr, got, cached
+            );
+        } else {
+            warn!(
+                "{}: {:08x} read {:08x}; BACKPLANE WINDOW DIVERGED, cached {:08x} but chip reports {:08x}",
+                what, addr, got, cached, actual
+            );
+        }
+
+        bus.backplane_window_invalidate();
+        let again = bus.bp_read32(addr).await;
+        warn!(
+            "{}: after forcing a window rewrite, {:08x} reads {:08x}",
+            what, addr, again
+        );
+    }
+
     async fn bt_has_work(&mut self, bus: &mut impl Bus) -> bool {
         let int_status = bus.bp_read32(CHIP.sdiod_core_base_address + SDIO_INT_STATUS).await;
         if int_status & I_HMB_FC_CHANGE != 0 {
@@ -482,7 +533,11 @@ impl<'a> BtRunner<'a> {
                 // makes the `% BTSDIO_FWBUF_SIZE` below produce an `available`
                 // that has nothing to do with what the firmware wrote.
                 if write_pointer >= BTSDIO_FWBUF_SIZE {
-                    warn!("bt2host write pointer out of range: {:08x}", write_pointer);
+                    if let Some(n) = self.bad_pointer.admit() {
+                        warn!("bt2host write pointer out of range (x{})", n);
+                        let at = self.addr + BTSDIO_OFFSET_BT2HOST_IN;
+                        self.diagnose_backplane(bus, "bt2host_in", at, write_pointer).await;
+                    }
                     break;
                 }
 
@@ -500,7 +555,12 @@ impl<'a> BtRunner<'a> {
                 let len = header[0] as u32 | ((header[1]) as u32) << 8 | ((header[2]) as u32) << 16;
                 let rounded_len = round_up(len, 4);
                 if available < 4 + rounded_len {
-                    warn!("ringbuf data not enough for a full packet?");
+                    if let Some(n) = self.short_packet.admit() {
+                        warn!(
+                            "ringbuf data not enough for a full packet? len {} available {} (x{})",
+                            len, available, n
+                        );
+                    }
                     break;
                 }
 
@@ -511,7 +571,9 @@ impl<'a> BtRunner<'a> {
                 // slice. Nothing the controller can legitimately send is this
                 // long, so treat it exactly like the truncated packet above.
                 if rounded_len as usize > BT_HCI_MTU - 1 {
-                    warn!("ringbuf packet longer than the HCI buffer: {}", len);
+                    if let Some(n) = self.short_packet.admit() {
+                        warn!("ringbuf packet longer than the HCI buffer: {} (x{})", len, n);
+                    }
                     break;
                 }
                 self.b2h_read_pointer = (self.b2h_read_pointer + 4) % BTSDIO_FWBUF_SIZE;

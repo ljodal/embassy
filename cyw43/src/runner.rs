@@ -17,6 +17,7 @@ use crate::fmt::Bytes;
 use crate::ioctl::{IoctlState, IoctlType, PendingIoctl};
 pub use crate::spi::SpiBusCyw43;
 use crate::structs::*;
+use crate::util::Throttle;
 use crate::util::try_until;
 use crate::{Chip, ChipId, Core, MTU, WithContext, events};
 
@@ -70,6 +71,19 @@ pub(crate) trait SealedBus {
     #[allow(unused)]
     async fn write32(&mut self, func: u8, addr: u32, val: u32);
     async fn wait_for_event(&mut self);
+
+    /// The backplane window the driver *believes* the chip is set to.
+    ///
+    /// `backplane_set_window` only writes the address bytes that differ from
+    /// this cached value, so the two can silently diverge if a write is lost —
+    /// and once they have, nothing rewrites them. Exposed so a caller that
+    /// detects nonsense coming back from the backplane can check whether the
+    /// window is where it thinks it is.
+    fn backplane_window_cached(&self) -> u32;
+
+    /// Forget the cached window, so the next access rewrites all three address
+    /// bytes unconditionally.
+    fn backplane_window_invalidate(&mut self);
 
     fn bus_type(&self) -> BusType {
         Self::TYPE
@@ -125,6 +139,7 @@ pub struct Runner<'a, BUS: Bus, CHIP: Chip> {
     ioctl_id: u16,
     sdpcm_seq: u8,
     sdpcm_seq_max: u8,
+    tx_stalled: Throttle,
 
     events: &'a Events,
 
@@ -158,6 +173,7 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
             ioctl_id: 0,
             sdpcm_seq: 0,
             sdpcm_seq_max: 1,
+            tx_stalled: Throttle::new(),
             events,
             secure_network,
             join_ok: false,
@@ -844,7 +860,15 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
                     }
                 }
             } else {
-                warn!("TX stalled");
+                if let Some(n) = self.tx_stalled.admit() {
+                    // The counters are the point: `has_credit` is false exactly
+                    // when these two are equal, and credit only ever comes back
+                    // from an SDPCM header the receive path managed to parse.
+                    warn!(
+                        "TX stalled: sdpcm_seq {} seq_max {} (x{})",
+                        self.sdpcm_seq, self.sdpcm_seq_max, n
+                    );
+                }
                 if matches!(self.bus.bus_type(), BusType::Sdio) {
                     // whd_bus_sdio_poke_wlan
                     self.bus

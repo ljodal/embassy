@@ -81,3 +81,28 @@ pub(crate) async fn try_until(mut func: impl AsyncFnMut() -> bool, duration: Dur
 
     Err(crate::Error)
 }
+
+/// Log the first few of a repeating condition, then one in `EVERY` after that.
+///
+/// When the shared bus goes wrong it goes wrong on every poll, and an
+/// unthrottled `warn!` per poll buries the transition — the only part of the
+/// log that carries any information — under a quarter of a million identical
+/// lines.
+pub(crate) struct Throttle {
+    seen: u32,
+}
+
+impl Throttle {
+    const FIRST: u32 = 8;
+    const EVERY: u32 = 4096;
+
+    pub(crate) const fn new() -> Self {
+        Self { seen: 0 }
+    }
+
+    /// Whether this occurrence should be logged, and how many have been seen.
+    pub(crate) fn admit(&mut self) -> Option<u32> {
+        self.seen += 1;
+        (self.seen <= Self::FIRST || self.seen % Self::EVERY == 0).then_some(self.seen)
+    }
+}

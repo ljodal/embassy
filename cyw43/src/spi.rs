@@ -406,6 +406,16 @@ where
         self.writen(func, addr, val, 4).await
     }
 
+    fn backplane_window_cached(&self) -> u32 {
+        self.backplane_window
+    }
+
+    fn backplane_window_invalidate(&mut self) {
+        // The same sentinel `new` uses: no real window matches it, so every
+        // address byte gets written on the next `backplane_set_window`.
+        self.backplane_window = 0xAAAA_AAAA;
+    }
+
     async fn wait_for_event(&mut self) {
         self.spi.wait_for_event().await;
     }
