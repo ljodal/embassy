@@ -90,19 +90,25 @@ pub(crate) async fn try_until(mut func: impl AsyncFnMut() -> bool, duration: Dur
 /// lines.
 pub(crate) struct Throttle {
     seen: u32,
+    every: u32,
 }
 
 impl Throttle {
     const FIRST: u32 = 8;
-    const EVERY: u32 = 4096;
 
     pub(crate) const fn new() -> Self {
-        Self { seen: 0 }
+        Self::every(4096)
+    }
+
+    /// A throttle that reports one in `every` after the first few, for a signal
+    /// rare enough that 4096 would hide whether it is still happening.
+    pub(crate) const fn every(every: u32) -> Self {
+        Self { seen: 0, every }
     }
 
     /// Whether this occurrence should be logged, and how many have been seen.
     pub(crate) fn admit(&mut self) -> Option<u32> {
         self.seen += 1;
-        (self.seen <= Self::FIRST || self.seen % Self::EVERY == 0).then_some(self.seen)
+        (self.seen <= Self::FIRST || self.seen % self.every == 0).then_some(self.seen)
     }
 }

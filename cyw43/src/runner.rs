@@ -186,7 +186,7 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
             sdpcm_seq_max: 1,
             tx_stalled: Throttle::new(),
             bus_error: Throttle::new(),
-            stale_status: Throttle::new(),
+            stale_status: Throttle::every(256),
             events,
             secure_network,
             join_ok: false,
@@ -1027,16 +1027,36 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
                     let status = self.bus.read32(FUNC_BUS, SPI_STATUS_REGISTER).await;
                     trace!("check status{}", FormatStatus(status));
 
-                    // Whether that would have mattered is the measurement: only
-                    // a disagreement in the length field can mis-size the read.
+                    // What the measurement is actually after: would the cached
+                    // word have led somewhere different? A bare length
+                    // difference does not: with F2_PKT_AVAILABLE clear the
+                    // caller breaks out without reading at all, whatever the
+                    // length field says. So classify by what would have
+                    // happened, because the two directions implicate different
+                    // halves of the latched error -- reading more than the FIFO
+                    // holds is a read underflow, and failing to drain a FIFO the
+                    // chip is filling is a write overflow.
                     if cached != 0 {
+                        let cached_avail = cached & STATUS_F2_PKT_AVAILABLE != 0;
+                        let fresh_avail = status & STATUS_F2_PKT_AVAILABLE != 0;
                         let cached_len = (cached & STATUS_F2_PKT_LEN_MASK) >> STATUS_F2_PKT_LEN_SHIFT;
                         let fresh_len = (status & STATUS_F2_PKT_LEN_MASK) >> STATUS_F2_PKT_LEN_SHIFT;
-                        if cached_len != fresh_len {
+
+                        let effect = match (cached_avail, fresh_avail) {
+                            (false, true) => Some("would have skipped a waiting packet"),
+                            (true, false) => Some("would have read a packet that is not there"),
+                            (true, true) if cached_len > fresh_len => {
+                                Some("would have read past the end of the packet")
+                            }
+                            (true, true) if cached_len < fresh_len => Some("would have left bytes in the FIFO"),
+                            _ => None,
+                        };
+
+                        if let Some(effect) = effect {
                             if let Some(n) = self.stale_status.admit() {
                                 warn!(
-                                    "stale gSPI status would have mis-sized an F2 read: cached {:08x} (len {}) vs fresh {:08x} (len {}) (x{})",
-                                    cached, cached_len, status, fresh_len, n
+                                    "stale gSPI status {}: cached {:08x} (avail {}, len {}) vs fresh {:08x} (avail {}, len {}) (x{})",
+                                    effect, cached, cached_avail, cached_len, status, fresh_avail, fresh_len, n
                                 );
                             }
                         }
