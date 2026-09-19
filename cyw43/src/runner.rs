@@ -1005,6 +1005,20 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
                                 f1 & SPI_FUNCTIONX_READY != 0,
                                 n
                             );
+
+                            // The first one is the only one that says how this
+                            // started: on hardware it carries
+                            // F2_F3_FIFO_WR_OVERFLOW, which the clear then
+                            // removes, and every later error is the aftermath.
+                            // So spend a couple of extra bus reads on it.
+                            if n == 1 {
+                                let cached = self.bus.take_cached_status();
+                                let status = self.bus.read32(FUNC_BUS, SPI_STATUS_REGISTER).await;
+                                warn!(
+                                    "first gSPI bus error: status {:08x} (cached was {:08x}), credit {}/{}",
+                                    status, cached, self.sdpcm_seq, self.sdpcm_seq_max
+                                );
+                            }
                         }
                     }
                     self.bus.write16(FUNC_BUS, REG_BUS_INTERRUPT, irq).await;
