@@ -992,7 +992,19 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
                 if irq != 0 {
                     if irq & IRQ_BUS_OVERFLOW_UNDERFLOW != 0 {
                         if let Some(n) = self.bus_error.admit() {
-                            warn!("gSPI bus error, clearing: irq {:04x} (x{})", irq, n);
+                            // F1 is the backplane, and IRQ_F1_OVERFLOW means a
+                            // write was issued while it had requests still
+                            // pending. Whether it is ready *now* separates a
+                            // host that outran the backplane once from one that
+                            // is being refused outright.
+                            let f1 = self.bus.read16(FUNC_BUS, SPI_FUNCTION1_INFO).await;
+                            warn!(
+                                "gSPI bus error, clearing: irq {:04x}, F1 info {:04x} (ready {}) (x{})",
+                                irq,
+                                f1,
+                                f1 & SPI_FUNCTIONX_READY != 0,
+                                n
+                            );
                         }
                     }
                     self.bus.write16(FUNC_BUS, REG_BUS_INTERRUPT, irq).await;

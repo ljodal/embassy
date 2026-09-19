@@ -501,9 +501,20 @@ impl<'a> BtRunner<'a> {
 
         bus.backplane_window_invalidate();
         let again = bus.bp_read32(addr).await;
+
+        // The backplane is F1. If it is not ready, these reads were never going
+        // to return data, and the question becomes why the host kept issuing
+        // them rather than what came back.
+        let f1 = bus.read16(FUNC_BUS, SPI_FUNCTION1_INFO).await;
+        let irq = bus.read16(FUNC_BUS, REG_BUS_INTERRUPT).await;
         warn!(
-            "{}: after forcing a window rewrite, {:08x} reads {:08x}",
-            what, addr, again
+            "{}: after forcing a window rewrite, {:08x} reads {:08x}; F1 info {:04x} (ready {}), irq {:04x}",
+            what,
+            addr,
+            again,
+            f1,
+            f1 & SPI_FUNCTIONX_READY != 0,
+            irq
         );
     }
 

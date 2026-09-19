@@ -198,6 +198,12 @@ pub(crate) const BTFW_HEX_LINE_TYPE_ABSOLUTE_32BIT_ADDRESS: u8 = 5;
 
 // Bluetooth constants.
 pub(crate) const SPI_RESP_DELAY_F1: u32 = 0x001d;
+
+/// Per-function status, 16 bits. Bit 1 says the function is ready to be
+/// addressed; a backplane write issued while F1 is not ready is what
+/// `IRQ_F1_OVERFLOW` reports.
+pub(crate) const SPI_FUNCTION1_INFO: u32 = 0x000c;
+pub(crate) const SPI_FUNCTIONX_READY: u16 = 1 << 1;
 pub(crate) const WHD_BUS_SPI_BACKPLANE_READ_PADD_SIZE: u8 = 4;
 
 pub(crate) const BT2WLAN_PWRUP_WAKE: u32 = 3;
