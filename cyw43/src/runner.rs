@@ -72,6 +72,23 @@ pub(crate) trait SealedBus {
     async fn write32(&mut self, func: u8, addr: u32, val: u32);
     async fn wait_for_event(&mut self);
 
+    /// Read the two bus self-test registers that `init` checks.
+    ///
+    /// `REG_BUS_TEST_RO` always reads `FEEDBEAD` and `REG_BUS_TEST_RW` holds
+    /// whatever `init` wrote. Both live in F0, which needs neither the backplane
+    /// nor the window, so they answer the one question that matters when reads
+    /// start coming back as the status word: whether the gSPI bus itself is
+    /// still framing correctly, or only the backplane is stuck. Zeroes on SDIO.
+    async fn bus_selftest(&mut self) -> (u32, u32);
+
+    /// Rewrite the F0 configuration `init` sets, without the power cycle.
+    ///
+    /// Bus control word, backplane response delay, latched error bits and the
+    /// interrupt mask. None of it touches the chip's firmware or the backplane,
+    /// so it is the most that can be re-established without a full reset.
+    /// Nothing on SDIO.
+    async fn bus_reconfigure(&mut self);
+
     /// Take the status word the last SPI transfer returned, clearing it.
     ///
     /// gSPI hands back a status word with every transfer, and `read32` of
@@ -1018,6 +1035,36 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
                                     "first gSPI bus error: status {:08x} (cached was {:08x}), credit {}/{}",
                                     status, cached, self.sdpcm_seq, self.sdpcm_seq_max
                                 );
+
+                                // `REG_BUS_TEST_RO` answers FEEDBEAD unconditionally
+                                // and lives in F0, so it needs neither the backplane
+                                // nor the window. If it still reads FEEDBEAD then the
+                                // bus is framing fine and only the backplane is stuck;
+                                // if it comes back as the status word, the whole read
+                                // path has lost sync.
+                                let (ro, rw) = self.bus.bus_selftest().await;
+                                warn!(
+                                    "first gSPI bus error: bus self-test RO {:08x} (want {:08x}), RW {:08x} (want {:08x}) -> {}",
+                                    ro,
+                                    FEEDBEAD,
+                                    rw,
+                                    TEST_PATTERN,
+                                    if ro == FEEDBEAD && rw == TEST_PATTERN {
+                                        "F0 healthy, backplane stuck"
+                                    } else {
+                                        "F0 broken too"
+                                    }
+                                );
+
+                                // Then try to get it back without resetting the chip.
+                                // If rewriting the F0 configuration is enough, the
+                                // self-test and the backplane both come back and this
+                                // is recoverable in place; if not, recovery needs a
+                                // reset and that is worth knowing definitively.
+                                self.bus.bus_reconfigure().await;
+                                let (ro, rw) = self.bus.bus_selftest().await;
+                                let irq = self.bus.read16(FUNC_BUS, REG_BUS_INTERRUPT).await;
+                                warn!("after F0 reconfigure: RO {:08x}, RW {:08x}, irq {:04x}", ro, rw, irq);
                             }
                         }
                     }

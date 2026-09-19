@@ -406,6 +406,40 @@ where
         self.writen(func, addr, val, 4).await
     }
 
+    async fn bus_selftest(&mut self) -> (u32, u32) {
+        let ro = self.read32(FUNC_BUS, REG_BUS_TEST_RO).await;
+        let rw = self.read32(FUNC_BUS, REG_BUS_TEST_RW).await;
+        (ro, rw)
+    }
+
+    async fn bus_reconfigure(&mut self) {
+        // Deliberately not `init`: no WL_REG power cycle, no firmware reload,
+        // no backplane access. Just the F0 registers, in the order `init` sets
+        // them, so a bus whose configuration was lost gets it back.
+        self.write32_swapped(
+            FUNC_BUS,
+            REG_BUS_CTRL,
+            WORD_LENGTH_32
+                | HIGH_SPEED
+                | INTERRUPT_POLARITY_HIGH
+                | WAKE_UP
+                | 0x4 << (8 * REG_BUS_RESPONSE_DELAY)
+                | STATUS_ENABLE << (8 * REG_BUS_STATUS_ENABLE)
+                | INTR_WITH_STATUS << (8 * REG_BUS_STATUS_ENABLE),
+        )
+        .await;
+
+        self.write8(FUNC_BUS, SPI_RESP_DELAY_F1, WHD_BUS_SPI_BACKPLANE_READ_PADD_SIZE)
+            .await;
+
+        self.write8(
+            FUNC_BUS,
+            REG_BUS_INTERRUPT,
+            (IRQ_DATA_UNAVAILABLE | IRQ_COMMAND_ERROR | IRQ_DATA_ERROR | IRQ_F1_OVERFLOW) as u8,
+        )
+        .await;
+    }
+
     fn take_cached_status(&mut self) -> u32 {
         core::mem::take(&mut self.status)
     }

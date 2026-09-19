@@ -380,6 +380,13 @@ where
         let _ = self.cmd53_write(func, addr, &val).await;
     }
 
+    async fn bus_selftest(&mut self) -> (u32, u32) {
+        // The self-test registers are a gSPI thing.
+        (0, 0)
+    }
+
+    async fn bus_reconfigure(&mut self) {}
+
     fn take_cached_status(&mut self) -> u32 {
         // SDIO carries no status word alongside transfers.
         0
