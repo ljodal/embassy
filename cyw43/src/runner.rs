@@ -140,6 +140,7 @@ pub struct Runner<'a, BUS: Bus, CHIP: Chip> {
     sdpcm_seq: u8,
     sdpcm_seq_max: u8,
     tx_stalled: Throttle,
+    bus_error: Throttle,
 
     events: &'a Events,
 
@@ -174,6 +175,7 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
             sdpcm_seq: 0,
             sdpcm_seq_max: 1,
             tx_stalled: Throttle::new(),
+            bus_error: Throttle::new(),
             events,
             secure_network,
             join_ok: false,
@@ -964,10 +966,25 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
                     self.check_status(buf).await;
                 }
 
-                if irq & IRQ_DATA_UNAVAILABLE != 0 {
-                    // this seems to be ignorable with no ill effects.
-                    trace!("IRQ DATA_UNAVAILABLE, clearing...");
-                    self.bus.write16(FUNC_BUS, REG_BUS_INTERRUPT, 1).await;
+                // Every bit in this register is write-1-to-clear, and they
+                // latch. Writing a literal `1` acknowledges DATA_UNAVAILABLE
+                // and nothing else, so an F2 FIFO underflow or overflow stays
+                // set forever — and while it is set the chip answers reads with
+                // its status word instead of the data asked for. That is not a
+                // transient: every backplane read then returns the same status
+                // value, the SDPCM header no longer parses, so `update_credit`
+                // never runs, `has_credit` stays false, and both radios are
+                // down until the chip is reset.
+                //
+                // So write back everything that was set, which is what the C
+                // driver does (`if (spi_int) cyw43_write_reg_u16(..., spi_int)`).
+                if irq != 0 {
+                    if irq & IRQ_BUS_OVERFLOW_UNDERFLOW != 0 {
+                        if let Some(n) = self.bus_error.admit() {
+                            warn!("gSPI bus error, clearing: irq {:04x} (x{})", irq, n);
+                        }
+                    }
+                    self.bus.write16(FUNC_BUS, REG_BUS_INTERRUPT, irq).await;
                 }
 
                 #[cfg(feature = "bluetooth")]
@@ -988,6 +1005,27 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
 
                     if status & STATUS_F2_PKT_AVAILABLE != 0 {
                         let len = (status & STATUS_F2_PKT_LEN_MASK) >> STATUS_F2_PKT_LEN_SHIFT;
+
+                        // A zero or oversized length, or a read underflow, means
+                        // the status register is not describing a real frame.
+                        // Reading it anyway is how garbage gets into the SDPCM
+                        // parser. Abort and flush the F2 read FIFO instead --
+                        // this is the resynchronisation the C driver performs
+                        // at the same point, and the only way back to a sane
+                        // bus short of resetting the chip.
+                        if len == 0 || len > GSPI_MAX_F2_PACKET || status & STATUS_UNDERFLOW != 0 {
+                            if let Some(n) = self.bus_error.admit() {
+                                warn!(
+                                    "gSPI status describes no usable frame (status {:08x}, len {}); aborting the F2 read (x{})",
+                                    status, len, n
+                                );
+                            }
+                            self.bus
+                                .write8(FUNC_BACKPLANE, REG_BACKPLANE_FRAME_CONTROL, FRAME_CONTROL_ABORT_F2_READ)
+                                .await;
+                            break;
+                        }
+
                         if wlan_read(&mut self.bus, buf, true, 0, len as usize).await.is_err() {
                             debug!("spi wlan_read failed");
                             break;

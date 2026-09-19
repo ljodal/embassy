@@ -61,6 +61,13 @@ pub(crate) const REG_BACKPLANE_BACKPLANE_ADDRESS_LOW: u32 = 0x1000A;
 pub(crate) const REG_BACKPLANE_BACKPLANE_ADDRESS_MID: u32 = 0x1000B;
 pub(crate) const REG_BACKPLANE_BACKPLANE_ADDRESS_HIGH: u32 = 0x1000C;
 pub(crate) const REG_BACKPLANE_FRAME_CONTROL: u32 = 0x1000D;
+/// `REG_BACKPLANE_FRAME_CONTROL` bit 0: abort and flush the F2 read FIFO.
+pub(crate) const FRAME_CONTROL_ABORT_F2_READ: u8 = 1 << 0;
+
+/// Largest F2 packet the chip can legitimately announce, from the C driver's
+/// `LINK_MTU - GSPI_PACKET_OVERHEAD`. A length outside this is the status
+/// register lying, not a real frame.
+pub(crate) const GSPI_MAX_F2_PACKET: u32 = (1500 + 30 + 14) - 8;
 pub(crate) const REG_BACKPLANE_CHIP_CLOCK_CSR: u32 = 0x1000E;
 pub(crate) const REG_BACKPLANE_PULL_UP: u32 = 0x1000F;
 pub(crate) const REG_BACKPLANE_READ_FRAME_BC_LOW: u32 = 0x1001B;
@@ -144,6 +151,13 @@ pub(crate) const IRQ_DATA_ERROR: u16 = 0x0010; // Cleared by writing 1
 pub(crate) const IRQ_F2_PACKET_AVAILABLE: u16 = 0x0020;
 pub(crate) const IRQ_F3_PACKET_AVAILABLE: u16 = 0x0040;
 pub(crate) const IRQ_F1_OVERFLOW: u16 = 0x0080; // Due to last write. Bkplane has pending write requests
+
+/// The gSPI error conditions that latch and must be cleared by writing a 1.
+///
+/// Mirrors the C driver's `BUS_OVERFLOW_UNDERFLOW`. Left set, the bus keeps
+/// answering reads with its status word instead of the data that was asked for.
+pub(crate) const IRQ_BUS_OVERFLOW_UNDERFLOW: u16 =
+    IRQ_F1_OVERFLOW | IRQ_F2_F3_FIFO_RD_UNDERFLOW | IRQ_F2_F3_FIFO_WR_OVERFLOW;
 pub(crate) const IRQ_MISC_INTR0: u16 = 0x0100;
 pub(crate) const IRQ_MISC_INTR1: u16 = 0x0200;
 pub(crate) const IRQ_MISC_INTR2: u16 = 0x0400;
