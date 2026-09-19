@@ -406,6 +406,10 @@ where
         self.writen(func, addr, val, 4).await
     }
 
+    fn take_cached_status(&mut self) -> u32 {
+        core::mem::take(&mut self.status)
+    }
+
     fn backplane_window_cached(&self) -> u32 {
         self.backplane_window
     }

@@ -72,6 +72,15 @@ pub(crate) trait SealedBus {
     async fn write32(&mut self, func: u8, addr: u32, val: u32);
     async fn wait_for_event(&mut self);
 
+    /// Take the status word the last SPI transfer returned, clearing it.
+    ///
+    /// gSPI hands back a status word with every transfer, and `read32` of
+    /// `SPI_STATUS_REGISTER` returns that cached word rather than reading the
+    /// wire. Taking it here leaves the cache empty, so the read that follows
+    /// goes to the chip — and lets the caller compare the two. Zero on SDIO,
+    /// which has no such cache.
+    fn take_cached_status(&mut self) -> u32;
+
     /// The backplane window the driver *believes* the chip is set to.
     ///
     /// `backplane_set_window` only writes the address bytes that differ from
@@ -141,6 +150,7 @@ pub struct Runner<'a, BUS: Bus, CHIP: Chip> {
     sdpcm_seq_max: u8,
     tx_stalled: Throttle,
     bus_error: Throttle,
+    stale_status: Throttle,
 
     events: &'a Events,
 
@@ -176,6 +186,7 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
             sdpcm_seq_max: 1,
             tx_stalled: Throttle::new(),
             bus_error: Throttle::new(),
+            stale_status: Throttle::new(),
             events,
             secure_network,
             join_ok: false,
@@ -1000,8 +1011,36 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
         loop {
             match self.bus.bus_type() {
                 BusType::Spi => {
+                    // Take the cached status before reading, so the read below
+                    // reaches the chip rather than being answered from it.
+                    //
+                    // The cache is whatever the *last transfer* returned, and
+                    // with Bluetooth enabled that is very often a backplane
+                    // transaction on the BT ring rather than anything to do with
+                    // WLAN. Its F2 packet length describes the FIFO as it was
+                    // then; sizing a read with it afterwards is how the host
+                    // asks for more bytes than the FIFO holds, which is an F2
+                    // read underflow. The C driver reads this register fresh
+                    // every time, and so did this code before the status cache
+                    // arrived with the SDIO refactor.
+                    let cached = self.bus.take_cached_status();
                     let status = self.bus.read32(FUNC_BUS, SPI_STATUS_REGISTER).await;
                     trace!("check status{}", FormatStatus(status));
+
+                    // Whether that would have mattered is the measurement: only
+                    // a disagreement in the length field can mis-size the read.
+                    if cached != 0 {
+                        let cached_len = (cached & STATUS_F2_PKT_LEN_MASK) >> STATUS_F2_PKT_LEN_SHIFT;
+                        let fresh_len = (status & STATUS_F2_PKT_LEN_MASK) >> STATUS_F2_PKT_LEN_SHIFT;
+                        if cached_len != fresh_len {
+                            if let Some(n) = self.stale_status.admit() {
+                                warn!(
+                                    "stale gSPI status would have mis-sized an F2 read: cached {:08x} (len {}) vs fresh {:08x} (len {}) (x{})",
+                                    cached, cached_len, status, fresh_len, n
+                                );
+                            }
+                        }
+                    }
 
                     if status & STATUS_F2_PKT_AVAILABLE != 0 {
                         let len = (status & STATUS_F2_PKT_LEN_MASK) >> STATUS_F2_PKT_LEN_SHIFT;

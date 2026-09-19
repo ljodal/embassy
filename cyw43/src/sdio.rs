@@ -380,6 +380,11 @@ where
         let _ = self.cmd53_write(func, addr, &val).await;
     }
 
+    fn take_cached_status(&mut self) -> u32 {
+        // SDIO carries no status word alongside transfers.
+        0
+    }
+
     fn backplane_window_cached(&self) -> u32 {
         self.backplane_window
     }
