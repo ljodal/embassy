@@ -72,6 +72,12 @@ pub(crate) trait SealedBus {
     async fn write32(&mut self, func: u8, addr: u32, val: u32);
     async fn wait_for_event(&mut self);
 
+    /// Log the bus transactions leading up to the first error-flagged status.
+    ///
+    /// Recording freezes at that point, so this is the run-up to the fault
+    /// rather than whatever the diagnostics have done since. Nothing on SDIO.
+    fn dump_bus_ops(&mut self);
+
     /// Read the two bus self-test registers that `init` checks.
     ///
     /// `REG_BUS_TEST_RO` always reads `FEEDBEAD` and `REG_BUS_TEST_RW` holds
@@ -1029,6 +1035,12 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
                             // removes, and every later error is the aftermath.
                             // So spend a couple of extra bus reads on it.
                             if n == 1 {
+                                // First, before any of the diagnostics below add
+                                // transactions of their own: recording froze at the
+                                // first error-flagged status, so this is the run-up
+                                // to the fault rather than the aftermath.
+                                self.bus.dump_bus_ops();
+
                                 let cached = self.bus.take_cached_status();
                                 let status = self.bus.read32(FUNC_BUS, SPI_STATUS_REGISTER).await;
                                 warn!(

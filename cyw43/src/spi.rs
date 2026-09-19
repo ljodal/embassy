@@ -40,12 +40,83 @@ const fn slice32_ref(x: &Aligned<A4, [u8]>) -> &[u32] {
     unsafe { slice::from_raw_parts(x as *const Aligned<A4, [u8]> as *const u32, len) }
 }
 
+/// How many bus transactions to keep for post-mortem.
+const OP_LOG_LEN: usize = 48;
+
+/// The last transactions before the bus first reported an error.
+///
+/// The wedge is only ever *observed* well after it starts: the backplane has
+/// already been answering reads with the status word for a while before a ring
+/// pointer looks wrong, and the diagnostics that run then would overwrite the
+/// very history worth having. So recording stops the moment a transfer comes
+/// back with an error bit set, and what is left is the run-up to it.
+struct OpLog {
+    ops: [(u32, u32); OP_LOG_LEN],
+    next: usize,
+    len: usize,
+    frozen: bool,
+}
+
+impl OpLog {
+    const fn new() -> Self {
+        Self {
+            ops: [(0, 0); OP_LOG_LEN],
+            next: 0,
+            len: 0,
+            frozen: false,
+        }
+    }
+
+    /// Record one transaction and its status, unless already frozen.
+    ///
+    /// Freezes on the first status carrying an error bit, so the entry that
+    /// tripped it is the last one in the log.
+    fn record(&mut self, cmd: u32, status: u32) {
+        if self.frozen {
+            return;
+        }
+
+        self.ops[self.next] = (cmd, status);
+        self.next = (self.next + 1) % OP_LOG_LEN;
+        self.len = (self.len + 1).min(OP_LOG_LEN);
+
+        const ERRORS: u32 = STATUS_DATA_NOT_AVAILABLE | STATUS_UNDERFLOW | STATUS_OVERFLOW | STATUS_HOST_CMD_DATA_ERR;
+        if status & ERRORS != 0 {
+            self.frozen = true;
+        }
+    }
+
+    /// Oldest first, with the command word decoded.
+    fn dump(&self) {
+        if self.len == 0 {
+            warn!("bus op log: empty");
+            return;
+        }
+
+        warn!("bus op log: {} transactions, oldest first", self.len);
+        let start = (self.next + OP_LOG_LEN - self.len) % OP_LOG_LEN;
+        for i in 0..self.len {
+            let (cmd, status) = self.ops[(start + i) % OP_LOG_LEN];
+            warn!(
+                "  {}: {} func{} addr {:05x} len {} -> status {:08x}",
+                i,
+                if cmd >> 31 != 0 { "WR" } else { "RD" },
+                (cmd >> 28) & 0b11,
+                (cmd >> 11) & 0x1FFFF,
+                cmd & 0x7FF,
+                status
+            );
+        }
+    }
+}
+
 /// Doc
 pub struct SpiBus<PWR, SPI> {
     backplane_window: u32,
     pwr: PWR,
     spi: SPI,
     status: u32,
+    ops: OpLog,
 }
 
 impl<PWR, SPI> SpiBus<PWR, SPI>
@@ -59,6 +130,7 @@ where
             pwr,
             spi,
             status: 0,
+            ops: OpLog::new(),
         }
     }
 
@@ -128,6 +200,7 @@ where
         let len = if func == FUNC_BACKPLANE { 2 } else { 1 };
 
         self.status = self.spi.cmd_read(cmd, &mut buf[..len]).await;
+        self.ops.record(cmd, self.status);
 
         // if we read from the backplane, the result is in the second word, after the response delay
         if func == FUNC_BACKPLANE { buf[1] } else { buf[0] }
@@ -137,6 +210,7 @@ where
         let cmd = cmd_word(WRITE, INC_ADDR, func, addr, len);
 
         self.status = self.spi.cmd_write(&[cmd, val]).await;
+        self.ops.record(cmd, self.status);
     }
 
     async fn read32_swapped(&mut self, func: u8, addr: u32) -> u32 {
@@ -145,6 +219,7 @@ where
         let mut buf = [0; 1];
 
         self.status = self.spi.cmd_read(cmd, &mut buf).await;
+        self.ops.record(cmd, self.status);
 
         swap16(buf[0])
     }
@@ -154,6 +229,7 @@ where
         let buf = [swap16(cmd), swap16(val)];
 
         self.status = self.spi.cmd_write(&buf).await;
+        self.ops.record(cmd, self.status);
     }
 }
 
@@ -265,6 +341,7 @@ where
         let len_in_u32 = (len_in_u8 as usize).div_ceil(4);
 
         self.status = self.spi.cmd_read(cmd, &mut buf[..len_in_u32]).await;
+        self.ops.record(cmd, self.status);
 
         Ok(())
     }
@@ -273,7 +350,10 @@ where
         let len = buf.len() - 4;
         buf[..4].copy_from_slice(&cmd_word(WRITE, INC_ADDR, FUNC_WLAN, 0, len as u32).to_le_bytes());
 
+        // `wlan_write` builds its command into the head of the buffer.
+        let cmd = slice32_ref(buf)[0];
         self.status = self.spi.cmd_write(slice32_ref(buf)).await;
+        self.ops.record(cmd, self.status);
 
         Ok(())
     }
@@ -303,6 +383,7 @@ where
                 .spi
                 .cmd_read(cmd, &mut slice32_mut(buf)[..len.div_ceil(4) + 1])
                 .await;
+            self.ops.record(cmd, self.status);
 
             // when writing out the data, we skip the response-delay byte
             data[..len].copy_from_slice(&buf[4..][..len]);
@@ -338,6 +419,7 @@ where
             slice32_mut(buf)[0] = cmd;
 
             self.status = self.spi.cmd_write(&slice32_ref(buf)[..len.div_ceil(4) + 1]).await;
+            self.ops.record(cmd, self.status);
 
             // Advance ptr.
             addr += len as u32;
@@ -404,6 +486,10 @@ where
     #[allow(unused)]
     async fn write32(&mut self, func: u8, addr: u32, val: u32) {
         self.writen(func, addr, val, 4).await
+    }
+
+    fn dump_bus_ops(&mut self) {
+        self.ops.dump();
     }
 
     async fn bus_selftest(&mut self) -> (u32, u32) {
