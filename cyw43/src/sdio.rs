@@ -380,7 +380,7 @@ where
         let _ = self.cmd53_write(func, addr, &val).await;
     }
 
-    fn dump_bus_ops(&mut self) {}
+    async fn dump_bus_ops(&mut self) {}
 
     async fn bus_selftest(&mut self) -> (u32, u32) {
         // The self-test registers are a gSPI thing.

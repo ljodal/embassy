@@ -42,7 +42,10 @@ const fn slice32_ref(x: &Aligned<A4, [u8]>) -> &[u32] {
 }
 
 /// How many bus transactions to keep for post-mortem.
-const OP_LOG_LEN: usize = 48;
+///
+/// Kept small on purpose: the dump has twice now been cut off part way by the
+/// USB serial buffer, losing exactly the entries worth having.
+const OP_LOG_LEN: usize = 32;
 
 /// How many times to re-issue a read the device answered with
 /// `DATA_NOT_AVAILABLE` before giving up on it.
@@ -105,27 +108,15 @@ impl OpLog {
         }
     }
 
-    /// Oldest first, with the command word decoded.
-    fn dump(&self) {
-        if self.len == 0 {
-            warn!("bus op log: empty");
-            return;
-        }
+    /// How many transactions are held.
+    fn count(&self) -> usize {
+        self.len
+    }
 
-        warn!("bus op log: {} transactions, oldest first", self.len);
+    /// The `i`th transaction, oldest first.
+    fn get(&self, i: usize) -> (u32, u32) {
         let start = (self.next + OP_LOG_LEN - self.len) % OP_LOG_LEN;
-        for i in 0..self.len {
-            let (cmd, status) = self.ops[(start + i) % OP_LOG_LEN];
-            warn!(
-                "  {}: {} func{} addr {:05x} len {} -> status {:08x}",
-                i,
-                if cmd >> 31 != 0 { "WR" } else { "RD" },
-                (cmd >> 28) & 0b11,
-                (cmd >> 11) & 0x1FFFF,
-                cmd & 0x7FF,
-                status
-            );
-        }
+        self.ops[(start + i) % OP_LOG_LEN]
     }
 }
 
@@ -142,6 +133,8 @@ pub struct SpiBus<PWR, SPI> {
     reissued: Throttle,
     /// Writes the device could not take.
     overflowed: Throttle,
+    /// F2 read frames terminated because the device could not serve them.
+    f2_aborted: Throttle,
 }
 
 impl<PWR, SPI> SpiBus<PWR, SPI>
@@ -159,6 +152,7 @@ where
             starved: Throttle::every(1024),
             reissued: Throttle::every(1024),
             overflowed: Throttle::every(1024),
+            f2_aborted: Throttle::every(1024),
         }
     }
 
@@ -178,9 +172,12 @@ where
     ///
     /// Returns whether the data is trustworthy.
     async fn reissue(&mut self, func: u8, attempt: usize) -> bool {
-        // F0 is the bus itself: its registers are always readable, and a
-        // `DATA_NOT_AVAILABLE` seen there is a leftover from an F1/F2 read.
-        if func == FUNC_BUS || self.status & STATUS_DATA_NOT_AVAILABLE == 0 {
+        // Only the backplane re-issues. F0 registers are always readable, so a
+        // `DATA_NOT_AVAILABLE` seen there is a leftover from an F1 or F2 read;
+        // and F2 carries packet data, where asking again would clock the rest
+        // of a frame the device has already begun. F2 is handled in
+        // `wlan_read` by terminating the frame instead.
+        if func != FUNC_BACKPLANE || self.status & STATUS_DATA_NOT_AVAILABLE == 0 {
             // Count the reads that needed asking twice. Without this a quiet
             // run is ambiguous: it could mean the device answered everything
             // first time, or that it did not and the retry covered for it
@@ -212,6 +209,32 @@ where
         }
 
         true
+    }
+
+    /// Terminate an F2 read frame and drop the packet it was carrying.
+    ///
+    /// The device answered a WLAN data read with `DATA_NOT_AVAILABLE`, so what
+    /// came back is padding and the frame it had started is still open. Both
+    /// reference drivers handle this by terminating the frame rather than
+    /// re-reading it, because re-reading would clock out the remainder of a
+    /// packet whose beginning is already lost.
+    async fn abort_f2_read(&mut self) {
+        self.writen(
+            FUNC_BACKPLANE,
+            REG_BACKPLANE_FRAME_CONTROL,
+            FRAME_CONTROL_ABORT_F2_READ as u32,
+            1,
+        )
+        .await;
+
+        // "Wait whilst the FIFO is emptied of the packet; reading during this
+        // period would cause all zeros to be read." -- WHD. This code used to
+        // abort and carry straight on.
+        Timer::after_millis(1).await;
+
+        if let Some(n) = self.f2_aborted.admit() {
+            warn!("gSPI F2 read unanswered, frame terminated and packet dropped (x{})", n);
+        }
     }
 
     /// Report a write the device could not take, and wait for the function to
@@ -474,13 +497,12 @@ where
         let cmd = cmd_word(READ, INC_ADDR, FUNC_WLAN, 0, len_in_u8);
         let len_in_u32 = (len_in_u8 as usize).div_ceil(4);
 
-        for attempt in 0..=READ_RETRIES {
-            self.status = self.spi.cmd_read(cmd, &mut buf[..len_in_u32]).await;
-            self.ops.record(cmd, self.status);
+        self.status = self.spi.cmd_read(cmd, &mut buf[..len_in_u32]).await;
+        self.ops.record(cmd, self.status);
 
-            if self.reissue(FUNC_WLAN, attempt).await {
-                break;
-            }
+        if self.status & STATUS_DATA_NOT_AVAILABLE != 0 {
+            self.abort_f2_read().await;
+            return Err(crate::Error);
         }
 
         Ok(())
@@ -636,8 +658,32 @@ where
         self.writen(func, addr, val, 4).await
     }
 
-    fn dump_bus_ops(&mut self) {
-        self.ops.dump();
+    async fn dump_bus_ops(&mut self) {
+        let count = self.ops.count();
+        if count == 0 {
+            warn!("bus op log: empty");
+            return;
+        }
+
+        warn!("bus op log: {} transactions, oldest first", count);
+        for i in 0..count {
+            let (cmd, status) = self.ops.get(i);
+            warn!(
+                "  {}: {} f{} {:05x} len {} -> {:08x}",
+                i,
+                if cmd >> 31 != 0 { "WR" } else { "RD" },
+                (cmd >> 28) & 0b11,
+                (cmd >> 11) & 0x1FFFF,
+                cmd & 0x7FF,
+                status
+            );
+
+            // Paced, because this dump has twice been truncated by the USB
+            // serial buffer. It runs once per wedge, so the delay is free.
+            if i % 4 == 3 {
+                Timer::after_millis(2).await;
+            }
+        }
     }
 
     async fn bus_selftest(&mut self) -> (u32, u32) {

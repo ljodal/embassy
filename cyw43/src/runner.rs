@@ -76,7 +76,7 @@ pub(crate) trait SealedBus {
     ///
     /// Recording freezes at that point, so this is the run-up to the fault
     /// rather than whatever the diagnostics have done since. Nothing on SDIO.
-    fn dump_bus_ops(&mut self);
+    async fn dump_bus_ops(&mut self);
 
     /// Read the two bus self-test registers that `init` checks.
     ///
@@ -1039,7 +1039,7 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
                                 // transactions of their own: recording froze at the
                                 // first error-flagged status, so this is the run-up
                                 // to the fault rather than the aftermath.
-                                self.bus.dump_bus_ops();
+                                self.bus.dump_bus_ops().await;
 
                                 let cached = self.bus.take_cached_status();
                                 let status = self.bus.read32(FUNC_BUS, SPI_STATUS_REGISTER).await;
@@ -1066,6 +1066,29 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
                                     } else {
                                         "F0 broken too"
                                     }
+                                );
+
+                                // These all live in the device's own register
+                                // block, which answers even when the backplane
+                                // does not -- the window registers read back
+                                // correctly in every wedge so far. The byte
+                                // count is the interesting one: it is the
+                                // device's own tally of what the current read
+                                // frame still owes. A stuck non-zero count
+                                // would be direct evidence of a frame jammed
+                                // part way, which so far has only been
+                                // inferred from which accesses fail.
+                                let bc_low = self.bus.read8(FUNC_BACKPLANE, REG_BACKPLANE_READ_FRAME_BC_LOW).await;
+                                let bc_high = self.bus.read8(FUNC_BACKPLANE, REG_BACKPLANE_READ_FRAME_BC_HIGH).await;
+                                let devctl = self.bus.read8(FUNC_BACKPLANE, REG_BACKPLANE_DEVICE_CONTROL).await;
+                                let watermark = self.bus.read8(FUNC_BACKPLANE, REG_BACKPLANE_FUNCTION2_WATERMARK).await;
+                                let framectl = self.bus.read8(FUNC_BACKPLANE, REG_BACKPLANE_FRAME_CONTROL).await;
+                                warn!(
+                                    "first gSPI bus error: read frame bc {}, devctl {:02x}, f2 watermark {:02x}, framectl {:02x}",
+                                    ((bc_high as u16) << 8) | bc_low as u16,
+                                    devctl,
+                                    watermark,
+                                    framectl
                                 );
 
                                 // The backplane only answers while it is clocked.
@@ -1202,6 +1225,8 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
                             self.bus
                                 .write8(FUNC_BACKPLANE, REG_BACKPLANE_FRAME_CONTROL, FRAME_CONTROL_ABORT_F2_READ)
                                 .await;
+                            // Reading before the FIFO has drained returns zeros.
+                            Timer::after_millis(1).await;
                             break;
                         }
 
