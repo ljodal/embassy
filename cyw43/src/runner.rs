@@ -5,7 +5,7 @@ use aligned::{A4, Aligned};
 use embassy_futures::select::{Either4, select4};
 use embassy_net_driver_channel as ch;
 use embassy_net_driver_channel::driver::LinkState;
-use embassy_time::Duration;
+use embassy_time::{Duration, Timer};
 use sdio::sdio::{CCCR_INT_ENABLE, CCCR_IO_ENABLE, CCCR_IO_READY};
 
 use crate::chip::{
@@ -1068,6 +1068,22 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
                                     }
                                 );
 
+                                // The backplane only answers while it is clocked.
+                                // `init` asks for the HT clock once and never looks
+                                // again, so if the chip has dropped back to ALP -- or
+                                // to no clock at all -- every F1 access after that
+                                // goes unanswered, which is exactly what a wedge looks
+                                // like from here. This read is itself an F1 access, so
+                                // a status word coming back in place of the register is
+                                // as much of an answer as a plausible value is.
+                                let clock = self.bus.read8(FUNC_BACKPLANE, REG_BACKPLANE_CHIP_CLOCK_CSR).await;
+                                warn!(
+                                    "first gSPI bus error: chip clock csr {:02x} (alp avail {}, ht avail {})",
+                                    clock,
+                                    clock & BACKPLANE_ALP_AVAIL != 0,
+                                    clock & BACKPLANE_HT_AVAIL != 0
+                                );
+
                                 // Then try to get it back without resetting the chip.
                                 // If rewriting the F0 configuration is enough, the
                                 // self-test and the backplane both come back and this
@@ -1077,6 +1093,25 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
                                 let (ro, rw) = self.bus.bus_selftest().await;
                                 let irq = self.bus.read16(FUNC_BUS, REG_BUS_INTERRUPT).await;
                                 warn!("after F0 reconfigure: RO {:08x}, RW {:08x}, irq {:04x}", ro, rw, irq);
+
+                                // And if the clock is what went, ask for it back: HT
+                                // requested and forced on, then a moment to settle.
+                                // Recovering here would name the cause outright.
+                                self.bus
+                                    .write8(
+                                        FUNC_BACKPLANE,
+                                        REG_BACKPLANE_CHIP_CLOCK_CSR,
+                                        BACKPLANE_HT_AVAIL_REQ | BACKPLANE_FORCE_HT as u8,
+                                    )
+                                    .await;
+                                Timer::after_millis(10).await;
+                                let clock = self.bus.read8(FUNC_BACKPLANE, REG_BACKPLANE_CHIP_CLOCK_CSR).await;
+                                warn!(
+                                    "after HT request: chip clock csr {:02x} (alp avail {}, ht avail {})",
+                                    clock,
+                                    clock & BACKPLANE_ALP_AVAIL != 0,
+                                    clock & BACKPLANE_HT_AVAIL != 0
+                                );
                             }
                         }
                     }

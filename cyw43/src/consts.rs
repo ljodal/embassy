@@ -125,6 +125,8 @@ pub(crate) const BACKPLANE_FORCE_HW_CLKREQ_OFF: u8 = 0x20;
 pub(crate) const BACKPLANE_FORCE_ALP: u8 = 0x01;
 pub(crate) const BACKPLANE_FORCE_HT: u32 = 0x02;
 pub(crate) const BACKPLANE_HT_AVAIL_REQ: u8 = 0x10;
+/// `REG_BACKPLANE_CHIP_CLOCK_CSR` bit 7: the HT clock is running.
+pub(crate) const BACKPLANE_HT_AVAIL: u8 = 0x80;
 pub(crate) const SBSDIO_WCTRL_WL_WAKE_TILL_ALP_AVAIL: u8 = 1 << 0;
 
 // Broadcom AMBA (Advanced Microcontroller Bus Architecture) Interconnect

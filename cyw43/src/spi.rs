@@ -8,6 +8,7 @@ use futures::FutureExt;
 
 use crate::consts::*;
 use crate::runner::{BusType, SealedBus};
+use crate::util::Throttle;
 
 /// Custom Spi Trait that _only_ supports the bus operation of the cyw43
 /// Implementors are expected to hold the CS pin low during an operation.
@@ -43,6 +44,10 @@ const fn slice32_ref(x: &Aligned<A4, [u8]>) -> &[u32] {
 /// How many bus transactions to keep for post-mortem.
 const OP_LOG_LEN: usize = 48;
 
+/// How many times to re-issue a read the device answered with
+/// `DATA_NOT_AVAILABLE` before giving up on it.
+const READ_RETRIES: usize = 3;
+
 /// The last transactions before the bus first reported an error.
 ///
 /// The wedge is only ever *observed* well after it starts: the backplane has
@@ -65,6 +70,16 @@ impl OpLog {
             len: 0,
             frozen: false,
         }
+    }
+
+    /// Start recording from a clean slate.
+    ///
+    /// The transfers `init` issues before the bus is configured come back with
+    /// meaningless status words -- the device is not yet returning status at
+    /// all -- so recording from power-on would freeze the log on the first
+    /// probe and keep nothing worth having.
+    fn arm(&mut self) {
+        *self = Self::new();
     }
 
     /// Record one transaction and its status, unless already frozen.
@@ -117,6 +132,8 @@ pub struct SpiBus<PWR, SPI> {
     spi: SPI,
     status: u32,
     ops: OpLog,
+    /// Reads the device could not serve, however many times they were re-issued.
+    starved: Throttle,
 }
 
 impl<PWR, SPI> SpiBus<PWR, SPI>
@@ -131,7 +148,46 @@ where
             spi,
             status: 0,
             ops: OpLog::new(),
+            starved: Throttle::every(1024),
         }
+    }
+
+    /// Re-issue a read the device could not serve, up to `READ_RETRIES` times.
+    ///
+    /// gSPI answers a read it has no data for by setting `DATA_NOT_AVAILABLE`
+    /// in the status word it returns with that very transfer, and clocking out
+    /// padding in place of the data. The read is not consumed: the host is
+    /// expected to notice and ask again. Nothing in this driver used to look,
+    /// so the padding -- which is whatever the device last had in its shift
+    /// register, typically a stale status word -- was handed to the caller as
+    /// if it were a register value or a ring pointer.
+    ///
+    /// `DATA_NOT_AVAILABLE` also latches in `REG_BUS_INTERRUPT`, and the status
+    /// word mirrors the latch, so it has to be cleared between attempts for the
+    /// next status to describe only the next transfer.
+    ///
+    /// Returns whether the data is trustworthy.
+    async fn reissue(&mut self, func: u8, attempt: usize) -> bool {
+        // F0 is the bus itself: its registers are always readable, and a
+        // `DATA_NOT_AVAILABLE` seen there is a leftover from an F1/F2 read.
+        if func == FUNC_BUS || self.status & STATUS_DATA_NOT_AVAILABLE == 0 {
+            return true;
+        }
+
+        if attempt < READ_RETRIES {
+            self.writen(FUNC_BUS, REG_BUS_INTERRUPT, IRQ_DATA_UNAVAILABLE as u32, 2)
+                .await;
+            return false;
+        }
+
+        if let Some(n) = self.starved.admit() {
+            warn!(
+                "gSPI func{} read unanswered after {} attempts, discarding: status {:08x} (x{})",
+                func, READ_RETRIES, self.status, n
+            );
+        }
+
+        true
     }
 
     async fn backplane_readn(&mut self, addr: u32, len: u32) -> u32 {
@@ -199,8 +255,14 @@ where
         // if we are reading from the backplane, we need an extra word for the response delay
         let len = if func == FUNC_BACKPLANE { 2 } else { 1 };
 
-        self.status = self.spi.cmd_read(cmd, &mut buf[..len]).await;
-        self.ops.record(cmd, self.status);
+        for attempt in 0..=READ_RETRIES {
+            self.status = self.spi.cmd_read(cmd, &mut buf[..len]).await;
+            self.ops.record(cmd, self.status);
+
+            if self.reissue(func, attempt).await {
+                break;
+            }
+        }
 
         // if we read from the backplane, the result is in the second word, after the response delay
         if func == FUNC_BACKPLANE { buf[1] } else { buf[0] }
@@ -330,6 +392,10 @@ where
         }
         self.write16(FUNC_BUS, REG_BUS_INTERRUPT_ENABLE, val).await;
 
+        // The bus is configured now, so from here on a status word means
+        // something. Anything recorded before this point does not.
+        self.ops.arm();
+
         Ok(())
     }
 
@@ -340,8 +406,14 @@ where
         let cmd = cmd_word(READ, INC_ADDR, FUNC_WLAN, 0, len_in_u8);
         let len_in_u32 = (len_in_u8 as usize).div_ceil(4);
 
-        self.status = self.spi.cmd_read(cmd, &mut buf[..len_in_u32]).await;
-        self.ops.record(cmd, self.status);
+        for attempt in 0..=READ_RETRIES {
+            self.status = self.spi.cmd_read(cmd, &mut buf[..len_in_u32]).await;
+            self.ops.record(cmd, self.status);
+
+            if self.reissue(FUNC_WLAN, attempt).await {
+                break;
+            }
+        }
 
         Ok(())
     }
@@ -378,12 +450,18 @@ where
 
             let cmd = cmd_word(READ, INC_ADDR, FUNC_BACKPLANE, window_offs, len as u32);
 
-            // round `buf` to word boundary, add one extra word for the response delay
-            self.status = self
-                .spi
-                .cmd_read(cmd, &mut slice32_mut(buf)[..len.div_ceil(4) + 1])
-                .await;
-            self.ops.record(cmd, self.status);
+            for attempt in 0..=READ_RETRIES {
+                // round `buf` to word boundary, add one extra word for the response delay
+                self.status = self
+                    .spi
+                    .cmd_read(cmd, &mut slice32_mut(buf)[..len.div_ceil(4) + 1])
+                    .await;
+                self.ops.record(cmd, self.status);
+
+                if self.reissue(FUNC_BACKPLANE, attempt).await {
+                    break;
+                }
+            }
 
             // when writing out the data, we skip the response-delay byte
             data[..len].copy_from_slice(&buf[4..][..len]);
