@@ -48,6 +48,10 @@ const OP_LOG_LEN: usize = 48;
 /// `DATA_NOT_AVAILABLE` before giving up on it.
 const READ_RETRIES: usize = 3;
 
+/// How many times to ask a function whether it is ready again after a write
+/// overflowed its FIFO, before carrying on regardless.
+const WRITE_BACKOFF: usize = 8;
+
 /// The last transactions before the bus first reported an error.
 ///
 /// The wedge is only ever *observed* well after it starts: the backplane has
@@ -136,6 +140,8 @@ pub struct SpiBus<PWR, SPI> {
     starved: Throttle,
     /// Reads the device could not serve at first but answered on a re-issue.
     reissued: Throttle,
+    /// Writes the device could not take.
+    overflowed: Throttle,
 }
 
 impl<PWR, SPI> SpiBus<PWR, SPI>
@@ -152,6 +158,7 @@ where
             ops: OpLog::new(),
             starved: Throttle::every(1024),
             reissued: Throttle::every(1024),
+            overflowed: Throttle::every(1024),
         }
     }
 
@@ -188,8 +195,12 @@ where
         }
 
         if attempt < READ_RETRIES {
-            self.writen(FUNC_BUS, REG_BUS_INTERRUPT, IRQ_DATA_UNAVAILABLE as u32, 2)
-                .await;
+            // Written out longhand rather than through `writen`, which reads
+            // the function info register on an overflow and would make this
+            // an async cycle.
+            let cmd = cmd_word(WRITE, INC_ADDR, FUNC_BUS, REG_BUS_INTERRUPT, 2);
+            self.status = self.spi.cmd_write(&[cmd, IRQ_DATA_UNAVAILABLE as u32]).await;
+            self.ops.record(cmd, self.status);
             return false;
         }
 
@@ -201,6 +212,49 @@ where
         }
 
         true
+    }
+
+    /// Report a write the device could not take, and wait for the function to
+    /// report itself ready before the next one goes out.
+    ///
+    /// Status bit 2 is "FIFO overflow occurred due to current (F1, F2, F3)
+    /// write command" -- the device could not accept what was just sent.
+    /// Nothing in this driver looked at it, so a backplane write that
+    /// overflowed was indistinguishable from one that landed, and the next
+    /// write went out on top of it.
+    ///
+    /// Deliberately does not re-issue the write. How much of it landed is not
+    /// knowable from here, and repeating a partial write would duplicate bytes
+    /// in the Bluetooth ring. Backing off until the function is ready again is
+    /// the part that is safe without that knowledge.
+    async fn absorbed(&mut self, func: u8) {
+        if func == FUNC_BUS || self.status & STATUS_OVERFLOW == 0 {
+            return;
+        }
+
+        let info_reg = if func == FUNC_WLAN {
+            SPI_FUNCTION2_INFO
+        } else {
+            SPI_FUNCTION1_INFO
+        };
+
+        let mut info = 0;
+        for _ in 0..WRITE_BACKOFF {
+            info = self.read16(FUNC_BUS, info_reg).await;
+            if info & SPI_FUNCTIONX_READY != 0 {
+                break;
+            }
+        }
+
+        if let Some(n) = self.overflowed.admit() {
+            warn!(
+                "gSPI func{} write overflowed the FIFO: info {:04x} (ready {}) (x{})",
+                func,
+                info,
+                info & SPI_FUNCTIONX_READY != 0,
+                n
+            );
+        }
     }
 
     async fn backplane_readn(&mut self, addr: u32, len: u32) -> u32 {
@@ -286,6 +340,7 @@ where
 
         self.status = self.spi.cmd_write(&[cmd, val]).await;
         self.ops.record(cmd, self.status);
+        self.absorbed(func).await;
     }
 
     async fn read32_swapped(&mut self, func: u8, addr: u32) -> u32 {
@@ -439,6 +494,7 @@ where
         let cmd = slice32_ref(buf)[0];
         self.status = self.spi.cmd_write(slice32_ref(buf)).await;
         self.ops.record(cmd, self.status);
+        self.absorbed(FUNC_WLAN).await;
 
         Ok(())
     }
@@ -511,6 +567,7 @@ where
 
             self.status = self.spi.cmd_write(&slice32_ref(buf)[..len.div_ceil(4) + 1]).await;
             self.ops.record(cmd, self.status);
+            self.absorbed(FUNC_BACKPLANE).await;
 
             // Advance ptr.
             addr += len as u32;

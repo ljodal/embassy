@@ -205,6 +205,7 @@ pub(crate) const SPI_RESP_DELAY_F1: u32 = 0x001d;
 /// addressed; a backplane write issued while F1 is not ready is what
 /// `IRQ_F1_OVERFLOW` reports.
 pub(crate) const SPI_FUNCTION1_INFO: u32 = 0x000c;
+pub(crate) const SPI_FUNCTION2_INFO: u32 = 0x000e;
 pub(crate) const SPI_FUNCTIONX_READY: u16 = 1 << 1;
 pub(crate) const WHD_BUS_SPI_BACKPLANE_READ_PADD_SIZE: u8 = 4;
 
