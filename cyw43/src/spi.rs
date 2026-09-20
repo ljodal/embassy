@@ -134,6 +134,8 @@ pub struct SpiBus<PWR, SPI> {
     ops: OpLog,
     /// Reads the device could not serve, however many times they were re-issued.
     starved: Throttle,
+    /// Reads the device could not serve at first but answered on a re-issue.
+    reissued: Throttle,
 }
 
 impl<PWR, SPI> SpiBus<PWR, SPI>
@@ -149,6 +151,7 @@ where
             status: 0,
             ops: OpLog::new(),
             starved: Throttle::every(1024),
+            reissued: Throttle::every(1024),
         }
     }
 
@@ -171,6 +174,16 @@ where
         // F0 is the bus itself: its registers are always readable, and a
         // `DATA_NOT_AVAILABLE` seen there is a leftover from an F1/F2 read.
         if func == FUNC_BUS || self.status & STATUS_DATA_NOT_AVAILABLE == 0 {
+            // Count the reads that needed asking twice. Without this a quiet
+            // run is ambiguous: it could mean the device answered everything
+            // first time, or that it did not and the retry covered for it
+            // every time. Those call for opposite conclusions.
+            if attempt > 0
+                && let Some(n) = self.reissued.admit()
+            {
+                warn!("gSPI func{} read answered on attempt {} (x{})", func, attempt + 1, n);
+            }
+
             return true;
         }
 
