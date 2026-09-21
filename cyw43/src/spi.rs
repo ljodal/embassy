@@ -51,9 +51,12 @@ const OP_LOG_LEN: usize = 32;
 /// `DATA_NOT_AVAILABLE` before giving up on it.
 const READ_RETRIES: usize = 3;
 
-/// How many times to ask a function whether it is ready again after a write
-/// overflowed its FIFO, before carrying on regardless.
-const WRITE_BACKOFF: usize = 8;
+/// Placeholder status for a transaction whose status was not read.
+///
+/// Most transfers no longer cost an extra bus transaction to ask how they went;
+/// only the backplane and WLAN reads do. Zero is a status word with no bit set,
+/// so it never freezes the op log and is obvious in a dump.
+const UNINSTRUMENTED: u32 = 0;
 
 /// The last transactions before the bus first reported an error.
 ///
@@ -62,6 +65,10 @@ const WRITE_BACKOFF: usize = 8;
 /// pointer looks wrong, and the diagnostics that run then would overwrite the
 /// very history worth having. So recording stops the moment a transfer comes
 /// back with an error bit set, and what is left is the run-up to it.
+///
+/// Transactions whose status was not read carry `UNINSTRUMENTED`, which is the
+/// great majority of writes and F0 register reads. The ones that matter -- the
+/// backplane and WLAN reads -- carry the status that was read for them.
 struct OpLog {
     ops: [(u32, u32); OP_LOG_LEN],
     next: usize,
@@ -131,10 +138,16 @@ pub struct SpiBus<PWR, SPI> {
     starved: Throttle,
     /// Reads the device could not serve at first but answered on a re-issue.
     reissued: Throttle,
-    /// Writes the device could not take.
-    overflowed: Throttle,
     /// F2 read frames terminated because the device could not serve them.
     f2_aborted: Throttle,
+    /// Multi-byte backplane reads issued.
+    bp_reads: u32,
+    /// Of those, the ones an F2 packet arrived during.
+    bp_races: u32,
+    /// Of those races, the ones the device could not serve.
+    bp_race_losses: u32,
+    /// Paces the running tally of the above.
+    race_report: Throttle,
 }
 
 impl<PWR, SPI> SpiBus<PWR, SPI>
@@ -151,8 +164,56 @@ where
             ops: OpLog::new(),
             starved: Throttle::every(1024),
             reissued: Throttle::every(1024),
-            overflowed: Throttle::every(1024),
             f2_aborted: Throttle::every(1024),
+            bp_reads: 0,
+            bp_races: 0,
+            bp_race_losses: 0,
+            race_report: Throttle::every(64),
+        }
+    }
+
+    /// Read the bus status register.
+    ///
+    /// With `STATUS_ENABLE` clear the device no longer volunteers status, so
+    /// anything that wants it asks. `SPI_STATUS_REGISTER` is F0: it needs
+    /// neither the backplane nor the window, and has answered correctly in
+    /// every wedge so far, which is exactly the property wanted from the thing
+    /// used to detect one.
+    ///
+    /// Written longhand rather than through `readn`, which would call back into
+    /// here for backplane reads and make this an async cycle.
+    async fn read_status(&mut self) -> u32 {
+        let cmd = cmd_word(READ, INC_ADDR, FUNC_BUS, SPI_STATUS_REGISTER, 4);
+        let mut buf = [0u32; 1];
+        self.spi.cmd_read(cmd, &mut buf).await;
+        buf[0]
+    }
+
+    /// Account for one multi-byte backplane read against the arriving packet.
+    ///
+    /// Every wedge so far has been a long backplane read that the F2 packet
+    /// available bit set during. What that cannot say, from a log that only
+    /// ever gets captured at a failure, is how often the same collision happens
+    /// and is survived -- which is the difference between a cause and a
+    /// coincidence. So count both.
+    fn account_race(&mut self, before: u32, after: u32) {
+        self.bp_reads += 1;
+
+        let arrived = before & STATUS_F2_PKT_AVAILABLE == 0 && after & STATUS_F2_PKT_AVAILABLE != 0;
+        if !arrived {
+            return;
+        }
+
+        self.bp_races += 1;
+        if after & STATUS_DATA_NOT_AVAILABLE != 0 {
+            self.bp_race_losses += 1;
+        }
+
+        if self.race_report.admit().is_some() {
+            warn!(
+                "backplane reads: {} issued, {} raced an arriving packet, {} of those unserved",
+                self.bp_reads, self.bp_races, self.bp_race_losses
+            );
         }
     }
 
@@ -192,12 +253,8 @@ where
         }
 
         if attempt < READ_RETRIES {
-            // Written out longhand rather than through `writen`, which reads
-            // the function info register on an overflow and would make this
-            // an async cycle.
-            let cmd = cmd_word(WRITE, INC_ADDR, FUNC_BUS, REG_BUS_INTERRUPT, 2);
-            self.status = self.spi.cmd_write(&[cmd, IRQ_DATA_UNAVAILABLE as u32]).await;
-            self.ops.record(cmd, self.status);
+            self.writen(FUNC_BUS, REG_BUS_INTERRUPT, IRQ_DATA_UNAVAILABLE as u32, 2)
+                .await;
             return false;
         }
 
@@ -234,49 +291,6 @@ where
 
         if let Some(n) = self.f2_aborted.admit() {
             warn!("gSPI F2 read unanswered, frame terminated and packet dropped (x{})", n);
-        }
-    }
-
-    /// Report a write the device could not take, and wait for the function to
-    /// report itself ready before the next one goes out.
-    ///
-    /// Status bit 2 is "FIFO overflow occurred due to current (F1, F2, F3)
-    /// write command" -- the device could not accept what was just sent.
-    /// Nothing in this driver looked at it, so a backplane write that
-    /// overflowed was indistinguishable from one that landed, and the next
-    /// write went out on top of it.
-    ///
-    /// Deliberately does not re-issue the write. How much of it landed is not
-    /// knowable from here, and repeating a partial write would duplicate bytes
-    /// in the Bluetooth ring. Backing off until the function is ready again is
-    /// the part that is safe without that knowledge.
-    async fn absorbed(&mut self, func: u8) {
-        if func == FUNC_BUS || self.status & STATUS_OVERFLOW == 0 {
-            return;
-        }
-
-        let info_reg = if func == FUNC_WLAN {
-            SPI_FUNCTION2_INFO
-        } else {
-            SPI_FUNCTION1_INFO
-        };
-
-        let mut info = 0;
-        for _ in 0..WRITE_BACKOFF {
-            info = self.read16(FUNC_BUS, info_reg).await;
-            if info & SPI_FUNCTIONX_READY != 0 {
-                break;
-            }
-        }
-
-        if let Some(n) = self.overflowed.admit() {
-            warn!(
-                "gSPI func{} write overflowed the FIFO: info {:04x} (ready {}) (x{})",
-                func,
-                info,
-                info & SPI_FUNCTIONX_READY != 0,
-                n
-            );
         }
     }
 
@@ -346,8 +360,23 @@ where
         let len = if func == FUNC_BACKPLANE { 2 } else { 1 };
 
         for attempt in 0..=READ_RETRIES {
-            self.status = self.spi.cmd_read(cmd, &mut buf[..len]).await;
-            self.ops.record(cmd, self.status);
+            self.spi.cmd_read(cmd, &mut buf[..len]).await;
+
+            // Only the backplane spends a transaction on status. F0 registers
+            // are always readable and F2 is handled where it is read, so asking
+            // after every register access would double the traffic to learn
+            // nothing.
+            if func == FUNC_BACKPLANE {
+                self.status = self.read_status().await;
+            }
+            self.ops.record(
+                cmd,
+                if func == FUNC_BACKPLANE {
+                    self.status
+                } else {
+                    UNINSTRUMENTED
+                },
+            );
 
             if self.reissue(func, attempt).await {
                 break;
@@ -361,9 +390,8 @@ where
     async fn writen(&mut self, func: u8, addr: u32, val: u32, len: u32) {
         let cmd = cmd_word(WRITE, INC_ADDR, func, addr, len);
 
-        self.status = self.spi.cmd_write(&[cmd, val]).await;
-        self.ops.record(cmd, self.status);
-        self.absorbed(func).await;
+        self.spi.cmd_write(&[cmd, val]).await;
+        self.ops.record(cmd, UNINSTRUMENTED);
     }
 
     async fn read32_swapped(&mut self, func: u8, addr: u32) -> u32 {
@@ -434,7 +462,22 @@ where
                 | INTERRUPT_POLARITY_HIGH
                 | WAKE_UP
                 | 0x4 << (8 * REG_BUS_RESPONSE_DELAY)
-                | STATUS_ENABLE << (8 * REG_BUS_STATUS_ENABLE)
+                // `STATUS_ENABLE` is deliberately absent. It makes the device
+                // append a status word to every read and write, and neither
+                // reference driver turns it on: `cyw43_ll.c:1561` passes
+                // `INTR_WITH_STATUS` alone, and WHD writes
+                // `(0 & STATUS_ENABLE)` next to it, which reads like someone
+                // once tried the other way. `INTR_WITH_STATUS` only means
+                // anything "if status is sent", so it is inert here; it is kept
+                // because both references keep it.
+                //
+                // This driver used to set it and read the trailing word after
+                // every transfer. That put the chip in a mode no reference
+                // driver exercises, in the response path that wedges: on a
+                // backplane underrun mid-data the device had to abandon the
+                // data and still frame a trailing status. Status now comes from
+                // `SPI_STATUS_REGISTER`, which is F0 and answers even when the
+                // backplane does not.
                 | INTR_WITH_STATUS << (8 * REG_BUS_STATUS_ENABLE),
         )
         .await;
@@ -497,7 +540,8 @@ where
         let cmd = cmd_word(READ, INC_ADDR, FUNC_WLAN, 0, len_in_u8);
         let len_in_u32 = (len_in_u8 as usize).div_ceil(4);
 
-        self.status = self.spi.cmd_read(cmd, &mut buf[..len_in_u32]).await;
+        self.spi.cmd_read(cmd, &mut buf[..len_in_u32]).await;
+        self.status = self.read_status().await;
         self.ops.record(cmd, self.status);
 
         if self.status & STATUS_DATA_NOT_AVAILABLE != 0 {
@@ -514,9 +558,8 @@ where
 
         // `wlan_write` builds its command into the head of the buffer.
         let cmd = slice32_ref(buf)[0];
-        self.status = self.spi.cmd_write(slice32_ref(buf)).await;
-        self.ops.record(cmd, self.status);
-        self.absorbed(FUNC_WLAN).await;
+        self.spi.cmd_write(slice32_ref(buf)).await;
+        self.ops.record(cmd, UNINSTRUMENTED);
 
         Ok(())
     }
@@ -554,12 +597,26 @@ where
             );
 
             for attempt in 0..=READ_RETRIES {
+                // The status left by the previous transfer, so `account_race`
+                // can tell a packet that arrived *during* this read from one
+                // that was already waiting when it started -- the two look
+                // identical afterwards, and only the first is the collision
+                // under suspicion. Deliberately the stale value rather than a
+                // fresh read: every backplane read already costs one extra
+                // transaction for the status after it, and doubling that to
+                // sharpen the "before" would perturb the timing this is
+                // measuring. The fatal read is always preceded by another
+                // backplane read, so this is at most one transaction old.
+                let before = self.status;
+
                 // round `buf` to word boundary, add one extra word for the response delay
-                self.status = self
-                    .spi
+                self.spi
                     .cmd_read(cmd, &mut slice32_mut(buf)[..len.div_ceil(4) + 1])
                     .await;
+
+                self.status = self.read_status().await;
                 self.ops.record(cmd, self.status);
+                self.account_race(before, self.status);
 
                 if self.reissue(FUNC_BACKPLANE, attempt).await {
                     break;
@@ -605,9 +662,8 @@ where
             );
             slice32_mut(buf)[0] = cmd;
 
-            self.status = self.spi.cmd_write(&slice32_ref(buf)[..len.div_ceil(4) + 1]).await;
-            self.ops.record(cmd, self.status);
-            self.absorbed(FUNC_BACKPLANE).await;
+            self.spi.cmd_write(&slice32_ref(buf)[..len.div_ceil(4) + 1]).await;
+            self.ops.record(cmd, UNINSTRUMENTED);
 
             // Advance ptr.
             addr += len as u32;
@@ -661,14 +717,10 @@ where
     }
 
     async fn read32(&mut self, func: u8, addr: u32) -> u32 {
-        if func == FUNC_BUS && addr == SPI_STATUS_REGISTER && self.status != 0 {
-            let status = self.status;
-            self.status = 0;
-
-            status
-        } else {
-            self.readn(func, addr, 4).await
-        }
+        // No special case for `SPI_STATUS_REGISTER` any more: there is no
+        // cached status word to return in place of reading it, so every caller
+        // that asks for status gets it from the wire.
+        self.readn(func, addr, 4).await
     }
 
     #[allow(unused)]
@@ -686,15 +738,26 @@ where
         warn!("bus op log: {} transactions, oldest first", count);
         for i in 0..count {
             let (cmd, status) = self.ops.get(i);
-            warn!(
-                "  {}: {} f{} {:05x} len {} -> {:08x}",
-                i,
-                if cmd >> 31 != 0 { "WR" } else { "RD" },
-                (cmd >> 28) & 0b11,
-                (cmd >> 11) & 0x1FFFF,
-                cmd & 0x7FF,
-                status
-            );
+            if status == UNINSTRUMENTED {
+                warn!(
+                    "  {}: {} f{} {:05x} len {}",
+                    i,
+                    if cmd >> 31 != 0 { "WR" } else { "RD" },
+                    (cmd >> 28) & 0b11,
+                    (cmd >> 11) & 0x1FFFF,
+                    cmd & 0x7FF
+                );
+            } else {
+                warn!(
+                    "  {}: {} f{} {:05x} len {} -> {:08x}",
+                    i,
+                    if cmd >> 31 != 0 { "WR" } else { "RD" },
+                    (cmd >> 28) & 0b11,
+                    (cmd >> 11) & 0x1FFFF,
+                    cmd & 0x7FF,
+                    status
+                );
+            }
 
             // Paced, because this dump has twice been truncated by the USB
             // serial buffer. It runs once per wedge, so the delay is free.
@@ -722,7 +785,22 @@ where
                 | INTERRUPT_POLARITY_HIGH
                 | WAKE_UP
                 | 0x4 << (8 * REG_BUS_RESPONSE_DELAY)
-                | STATUS_ENABLE << (8 * REG_BUS_STATUS_ENABLE)
+                // `STATUS_ENABLE` is deliberately absent. It makes the device
+                // append a status word to every read and write, and neither
+                // reference driver turns it on: `cyw43_ll.c:1561` passes
+                // `INTR_WITH_STATUS` alone, and WHD writes
+                // `(0 & STATUS_ENABLE)` next to it, which reads like someone
+                // once tried the other way. `INTR_WITH_STATUS` only means
+                // anything "if status is sent", so it is inert here; it is kept
+                // because both references keep it.
+                //
+                // This driver used to set it and read the trailing word after
+                // every transfer. That put the chip in a mode no reference
+                // driver exercises, in the response path that wedges: on a
+                // backplane underrun mid-data the device had to abandon the
+                // data and still frame a trailing status. Status now comes from
+                // `SPI_STATUS_REGISTER`, which is F0 and answers even when the
+                // backplane does not.
                 | INTR_WITH_STATUS << (8 * REG_BUS_STATUS_ENABLE),
         )
         .await;
@@ -739,7 +817,11 @@ where
     }
 
     fn take_cached_status(&mut self) -> u32 {
-        core::mem::take(&mut self.status)
+        // Nothing to take. With `STATUS_ENABLE` clear the device does not
+        // append status to a transfer, so there is no cached word that could
+        // have been stale -- the failure mode this existed to measure cannot
+        // arise. Kept so the caller's diagnostic compiles and stays inert.
+        0
     }
 
     fn backplane_window_cached(&self) -> u32 {

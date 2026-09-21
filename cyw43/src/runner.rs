@@ -1091,6 +1091,45 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
                                     framectl
                                 );
 
+                                // Is the *bridge* dead, or only this window?
+                                // Every windowed read during a wedge has come
+                                // back as the same constant whatever address it
+                                // asked for -- but always from the Bluetooth
+                                // ring's window. Chipcommon lives at a
+                                // different window entirely and its ID is a
+                                // known constant, so it separates "the backplane
+                                // bridge is holding something it never finished"
+                                // from "this one window is wrong".
+                                let chip_id = self.bus.bp_read16(CHIPCOMMON_BASE_ADDRESS).await;
+                                warn!(
+                                    "first gSPI bus error: chipcommon id {:04x} -> {}",
+                                    chip_id,
+                                    if self.chip.id() == chip_id {
+                                        "another window still reads, so the bridge is alive"
+                                    } else {
+                                        "a different window fails too, so the bridge is stuck"
+                                    }
+                                );
+
+                                // Is there any lever short of a reset? Frame
+                                // terminate is documented for the F2 read path
+                                // and WHD only ever uses it there, but it is the
+                                // one control the device offers over an
+                                // in-progress read frame and it costs a single
+                                // register write to rule in or out. `framectl`
+                                // above has read 00 at every wedge, so nothing
+                                // has ever tried.
+                                self.bus
+                                    .write8(FUNC_BACKPLANE, REG_BACKPLANE_FRAME_CONTROL, FRAME_CONTROL_ABORT_F2_READ)
+                                    .await;
+                                Timer::after_millis(1).await;
+                                let chip_id = self.bus.bp_read16(CHIPCOMMON_BASE_ADDRESS).await;
+                                warn!(
+                                    "after frame terminate: chipcommon id {:04x} (recovered {})",
+                                    chip_id,
+                                    self.chip.id() == chip_id
+                                );
+
                                 // The backplane only answers while it is clocked.
                                 // `init` asks for the HT clock once and never looks
                                 // again, so if the chip has dropped back to ALP -- or

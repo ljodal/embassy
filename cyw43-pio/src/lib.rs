@@ -224,7 +224,12 @@ where
         }
     }
 
-    /// Write data to peripheral and return status.
+    /// Write data to peripheral.
+    ///
+    /// Returns whatever was clocked in during the turnaround, which is not a
+    /// status: with `STATUS_ENABLE` clear the device sends none. pico-sdk reads
+    /// nothing at all after a write, but the PIO program's read phase cannot be
+    /// shorter than one word, so a word is clocked and discarded.
     pub async fn write(&mut self, write: &[u32]) -> u32 {
         self.sm.set_enable(false);
         let write_bits = write.len() * 32 - 1;
@@ -251,10 +256,18 @@ where
     }
 
     /// Send command and read response into buffer.
+    ///
+    /// Returns zero. The driver runs the bus with `STATUS_ENABLE` clear, the
+    /// way `cyw43_ll.c` and WHD both do, so the device does not append a status
+    /// word to a transfer and there is none to return. Anything that wants
+    /// status reads `SPI_STATUS_REGISTER` for it.
     pub async fn cmd_read(&mut self, cmd: u32, read: &mut [u32]) -> u32 {
         self.sm.set_enable(false);
         let write_bits = 31;
-        let read_bits = read.len() * 32 + 32 - 1;
+        // Exactly the response: no trailing word for a status the device is not
+        // configured to send. pico-sdk's `cyw43_read_bytes` clocks
+        // `aligned_len + 4 + padding` for the same reason.
+        let read_bits = read.len() * 32 - 1;
 
         #[cfg(feature = "defmt")]
         defmt::trace!("cmd_read write={} read={}", write_bits, read_bits);
@@ -276,16 +289,10 @@ where
         let tx_fut = tx.dma_push(&mut self.dma_tx, slice::from_ref(&cmd), false);
         embassy_futures::join::join(tx_fut, rx_fut).await;
 
-        let mut status = 0;
-        self.sm
-            .rx()
-            .dma_pull(&mut self.dma_rx, slice::from_mut(&mut status), false)
-            .await;
-
         #[cfg(feature = "defmt")]
         defmt::trace!("cmd_read cmd = {:02x} len = {} read = {:08x}", cmd, read.len(), read);
 
-        status
+        0
     }
 }
 
