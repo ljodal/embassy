@@ -539,7 +539,19 @@ where
 
             self.backplane_set_window(addr).await;
 
-            let cmd = cmd_word(READ, INC_ADDR, FUNC_BACKPLANE, window_offs, len as u32);
+            // On gSPI the 32-bit access flag goes on every backplane transfer,
+            // not just the 4-byte ones: it tells the bridge to move the data in
+            // words rather than a byte at a time, so a 48-byte read costs the
+            // backplane 12 transactions instead of 48. `cyw43_ll.c` has it
+            // unconditional under `CYW43_USE_SPI` and applies it to bulk reads
+            // too; only the SDIO path makes it conditional on the length.
+            let cmd = cmd_word(
+                READ,
+                INC_ADDR,
+                FUNC_BACKPLANE,
+                window_offs | BACKPLANE_ADDRESS_32BIT_FLAG,
+                len as u32,
+            );
 
             for attempt in 0..=READ_RETRIES {
                 // round `buf` to word boundary, add one extra word for the response delay
@@ -584,7 +596,13 @@ where
 
             self.backplane_set_window(addr).await;
 
-            let cmd = cmd_word(WRITE, INC_ADDR, FUNC_BACKPLANE, window_offs, len as u32);
+            let cmd = cmd_word(
+                WRITE,
+                INC_ADDR,
+                FUNC_BACKPLANE,
+                window_offs | BACKPLANE_ADDRESS_32BIT_FLAG,
+                len as u32,
+            );
             slice32_mut(buf)[0] = cmd;
 
             self.status = self.spi.cmd_write(&slice32_ref(buf)[..len.div_ceil(4) + 1]).await;
