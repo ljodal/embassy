@@ -40,6 +40,14 @@ bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => usb::InterruptHandler<USB>;
 });
 
+/// `log::info!` with seconds since boot in front, for the USB log.
+macro_rules! tlog {
+    ($($arg:tt)*) => {{
+        let ms = embassy_time::Instant::now().as_millis();
+        log::info!("[{}.{:03}] {}", ms / 1000, ms % 1000, format_args!($($arg)*));
+    }};
+}
+
 // Set at build time: `WIFI_NETWORK=ssid WIFI_PASSWORD=pwd cargo build ...`
 const WIFI_NETWORK: &str = match option_env!("WIFI_NETWORK") {
     Some(s) => s,
@@ -77,7 +85,7 @@ async fn ble_task(bt_device: cyw43::bluetooth::BtDriver<'static>) {
             let _ = controller.read(&mut buf).await;
             events += 1;
             if events % 100 == 0 {
-                log::info!("{} ble events", events);
+                tlog!("{} ble events", events);
             }
         }
     };
@@ -101,7 +109,7 @@ async fn ble_task(bt_device: cyw43::bluetooth::BtDriver<'static>) {
             .await
             .unwrap();
         controller.exec(&LeSetScanEnable::new(true, false)).await.unwrap();
-        log::info!("ble scanning");
+        tlog!("ble scanning");
     };
 
     embassy_futures::join::join(read, setup).await;
@@ -171,18 +179,18 @@ async fn main(spawner: Spawner) {
         .join(WIFI_NETWORK, JoinOptions::new(WIFI_PASSWORD.as_bytes()))
         .await
     {
-        log::info!("join failed: {:?}", err);
+        tlog!("join failed: {:?}", err);
     }
     iface.wait_config_up().await;
-    log::info!("wifi up: {:?}", iface.ip_addrs());
+    tlog!("wifi up: {:?}", iface.ip_addrs());
 
     let delay = Duration::from_millis(250);
     loop {
-        log::info!("led on!");
+        tlog!("led on!");
         control.gpio_set(0, true).await;
         Timer::after(delay).await;
 
-        log::info!("led off!");
+        tlog!("led off!");
         control.gpio_set(0, false).await;
         Timer::after(delay).await;
     }
