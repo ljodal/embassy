@@ -1,0 +1,33 @@
+[package]
+edition = "2024"
+name = "rp235x-cyw43-wedge"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[features]
+default = ["wifi", "ble"]
+# Join Wi-Fi and answer pings (flood it from another machine).
+wifi = []
+# Load the Bluetooth firmware and keep the controller scanning.
+ble = ["cyw43/bluetooth", "dep:bt-hci"]
+
+[dependencies]
+embassy-executor = { version = "0.10.0", path = "../../embassy-executor", features = ["platform-cortex-m", "executor-thread", "executor-interrupt"] }
+embassy-time = { version = "0.5.1", path = "../../embassy-time" }
+embassy-rp = { version = "0.10.0", path = "../../embassy-rp", features = ["unstable-pac", "time-driver", "critical-section-impl", "rp235xa", "binary-info", "executor-thread", "executor-interrupt"] }
+embassy-net = { version = "0.9.1", path = "../../embassy-net", features = ["log", "ipv4", "dhcpv4", "medium-ethernet", "icmp-ping-reply"] }
+embassy-futures = { version = "0.1.2", path = "../../embassy-futures" }
+embassy-usb-logger = { version = "0.6.0", path = "../../embassy-usb-logger" }
+cyw43 = { version = "0.7.0", path = "../../cyw43", features = ["log"] }
+cyw43-pio = { version = "0.10.0", path = "../../cyw43-pio" }
+bt-hci = { version = "0.10.1", optional = true }
+
+log = "0.4"
+cortex-m-rt = "0.7.0"
+fixed = "1.23.1"
+static_cell = "2.1"
+panic-halt = "1.0"
+
+[profile.release]
+debug = true

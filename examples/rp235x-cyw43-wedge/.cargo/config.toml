@@ -1,0 +1,7 @@
+[target.'cfg(all(target_arch = "arm", target_os = "none"))']
+# USB flashing, no debug probe needed. Swap for `probe-rs run --chip RP235x`
+# if you have one (logs still come out over USB serial).
+runner = "picotool load -u -v -x -t elf"
+
+[build]
+target = "thumbv8m.main-none-eabihf"
