@@ -5,11 +5,13 @@
 #![no_std]
 #![no_main]
 
-use cyw43::aligned_bytes;
+use cyw43::{JoinOptions, aligned_bytes};
 use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
 use defmt::*;
 use defmt_rtt as _;
 use embassy_executor::Spawner;
+use embassy_net::StackStorage;
+use embassy_rp::clocks::RoscRng;
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, PIO0, USB};
 use embassy_rp::pio::{InterruptHandler, Pio};
@@ -37,6 +39,21 @@ bind_interrupts!(struct Irqs {
     DMA_IRQ_0 => dma::InterruptHandler<DMA_CH0>, dma::InterruptHandler<DMA_CH1>;
     USBCTRL_IRQ => usb::InterruptHandler<USB>;
 });
+
+// Set at build time: `WIFI_NETWORK=ssid WIFI_PASSWORD=pwd cargo build ...`
+const WIFI_NETWORK: &str = match option_env!("WIFI_NETWORK") {
+    Some(s) => s,
+    None => "ssid",
+};
+const WIFI_PASSWORD: &str = match option_env!("WIFI_PASSWORD") {
+    Some(s) => s,
+    None => "pwd",
+};
+
+#[embassy_executor::task]
+async fn net_task(mut runner: embassy_net::Runner<'static>) -> ! {
+    runner.run().await
+}
 
 #[embassy_executor::task]
 async fn logger_task(driver: usb::Driver<'static, USB>) {
@@ -132,7 +149,7 @@ async fn main(spawner: Spawner) {
 
     static STATE: StaticCell<cyw43::State> = StaticCell::new();
     let state = STATE.init(cyw43::State::new());
-    let (_net_device, bt_device, mut control, runner) =
+    let (net_device, bt_device, mut control, runner) =
         cyw43::new_with_bluetooth(state, pwr, spi, fw, btfw, nvram).await;
     spawner.spawn(unwrap!(cyw43_task(runner)));
 
@@ -142,6 +159,22 @@ async fn main(spawner: Spawner) {
         .await;
 
     spawner.spawn(unwrap!(ble_task(bt_device)));
+
+    static STACK: StaticCell<StackStorage> = StaticCell::new();
+    let (stack, runner) = embassy_net::Stack::new(STACK.init(StackStorage::new()), RoscRng.next_u64());
+    static DEVICE: StaticCell<cyw43::NetDriver<'static>> = StaticCell::new();
+    let iface = unwrap!(stack.add_iface(DEVICE.init(net_device)));
+    unwrap!(iface.set_dhcpv4(Some(Default::default())));
+    spawner.spawn(unwrap!(net_task(runner)));
+
+    while let Err(err) = control
+        .join(WIFI_NETWORK, JoinOptions::new(WIFI_PASSWORD.as_bytes()))
+        .await
+    {
+        log::info!("join failed: {:?}", err);
+    }
+    iface.wait_config_up().await;
+    log::info!("wifi up: {:?}", iface.ip_addrs());
 
     let delay = Duration::from_millis(250);
     loop {
