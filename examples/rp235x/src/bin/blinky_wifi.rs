@@ -11,9 +11,9 @@ use defmt::*;
 use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_rp::gpio::{Level, Output};
-use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, PIO0};
+use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, PIO0, USB};
 use embassy_rp::pio::{InterruptHandler, Pio};
-use embassy_rp::{bind_interrupts, dma};
+use embassy_rp::{bind_interrupts, dma, usb};
 use embassy_time::{Duration, Timer};
 use panic_probe as _;
 use static_cell::StaticCell;
@@ -35,7 +35,60 @@ pub static PICOTOOL_ENTRIES: [embassy_rp::binary_info::EntryAddr; 4] = [
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => InterruptHandler<PIO0>;
     DMA_IRQ_0 => dma::InterruptHandler<DMA_CH0>, dma::InterruptHandler<DMA_CH1>;
+    USBCTRL_IRQ => usb::InterruptHandler<USB>;
 });
+
+#[embassy_executor::task]
+async fn logger_task(driver: usb::Driver<'static, USB>) {
+    embassy_usb_logger::run!(1024, log::LevelFilter::Info, driver);
+}
+
+#[embassy_executor::task]
+async fn ble_task(bt_device: cyw43::bluetooth::BtDriver<'static>) {
+    use bt_hci::cmd::controller_baseband::{Reset, SetEventMask};
+    use bt_hci::cmd::le::{LeSetEventMask, LeSetScanEnable, LeSetScanParams};
+    use bt_hci::controller::{Controller, ControllerCmdSync, ExternalController};
+    use bt_hci::param::{AddrKind, EventMask, LeEventMask, LeScanKind, ScanningFilterPolicy};
+
+    let controller: ExternalController<_, 4> = ExternalController::new(bt_device);
+
+    // Command responses arrive through `read`, so it runs alongside the setup.
+    let read = async {
+        let mut buf = controller.alloc_buf().unwrap();
+        let mut events = 0u32;
+        loop {
+            let _ = controller.read(&mut buf).await;
+            events += 1;
+            if events % 100 == 0 {
+                log::info!("{} ble events", events);
+            }
+        }
+    };
+
+    // Passive scan with duplicate filtering off, so advertising reports keep coming.
+    let setup = async {
+        controller.exec(&Reset::new()).await.unwrap();
+        let mask = EventMask::new().enable_le_meta(true);
+        controller.exec(&SetEventMask::new(mask)).await.unwrap();
+        let le_mask = LeEventMask::new().enable_le_adv_report(true);
+        controller.exec(&LeSetEventMask::new(le_mask)).await.unwrap();
+        let interval = bt_hci::param::Duration::from_millis(100);
+        controller
+            .exec(&LeSetScanParams::new(
+                LeScanKind::Passive,
+                interval,
+                interval,
+                AddrKind::PUBLIC,
+                ScanningFilterPolicy::BasicUnfiltered,
+            ))
+            .await
+            .unwrap();
+        controller.exec(&LeSetScanEnable::new(true, false)).await.unwrap();
+        log::info!("ble scanning");
+    };
+
+    embassy_futures::join::join(read, setup).await;
+}
 
 #[embassy_executor::task]
 async fn cyw43_task(
@@ -47,9 +100,11 @@ async fn cyw43_task(
 #[embassy_executor::main(executor = "embassy_rp::executor::Executor", entry = "cortex_m_rt::entry")]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
+    spawner.spawn(unwrap!(logger_task(usb::Driver::new(p.USB, Irqs))));
     let fw = aligned_bytes!("../../../../cyw43-firmware/43439A0.bin");
     let clm = aligned_bytes!("../../../../cyw43-firmware/43439A0_clm.bin");
     let nvram = aligned_bytes!("../../../../cyw43-firmware/nvram_rp2040.bin");
+    let btfw = aligned_bytes!("../../../../cyw43-firmware/43439A0_btfw.bin");
 
     // To make flashing faster for development, you may want to flash the firmwares independently
     // at hardcoded addresses, instead of baking them into the program with `include_bytes!`:
@@ -77,7 +132,8 @@ async fn main(spawner: Spawner) {
 
     static STATE: StaticCell<cyw43::State> = StaticCell::new();
     let state = STATE.init(cyw43::State::new());
-    let (_net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw, nvram).await;
+    let (_net_device, bt_device, mut control, runner) =
+        cyw43::new_with_bluetooth(state, pwr, spi, fw, btfw, nvram).await;
     spawner.spawn(unwrap!(cyw43_task(runner)));
 
     control.init(clm).await;
@@ -85,13 +141,15 @@ async fn main(spawner: Spawner) {
         .set_power_management(cyw43::PowerManagementMode::PowerSave)
         .await;
 
+    spawner.spawn(unwrap!(ble_task(bt_device)));
+
     let delay = Duration::from_millis(250);
     loop {
-        info!("led on!");
+        log::info!("led on!");
         control.gpio_set(0, true).await;
         Timer::after(delay).await;
 
-        info!("led off!");
+        log::info!("led off!");
         control.gpio_set(0, false).await;
         Timer::after(delay).await;
     }
