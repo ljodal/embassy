@@ -38,6 +38,14 @@ bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => usb::InterruptHandler<USB>;
 });
 
+/// `log::info!` with seconds since boot in front, for the USB log.
+macro_rules! tlog {
+    ($($arg:tt)*) => {{
+        let ms = embassy_time::Instant::now().as_millis();
+        log::info!("[{}.{:03}] {}", ms / 1000, ms % 1000, format_args!($($arg)*));
+    }};
+}
+
 #[embassy_executor::task]
 async fn logger_task(driver: usb::Driver<'static, USB>) {
     embassy_usb_logger::run!(1024, log::LevelFilter::Info, driver);
@@ -60,7 +68,7 @@ async fn ble_task(bt_device: cyw43::bluetooth::BtDriver<'static>) {
             let _ = controller.read(&mut buf).await;
             events += 1;
             if events % 100 == 0 {
-                log::info!("{} ble events", events);
+                tlog!("{} ble events", events);
             }
         }
     };
@@ -84,7 +92,7 @@ async fn ble_task(bt_device: cyw43::bluetooth::BtDriver<'static>) {
             .await
             .unwrap();
         controller.exec(&LeSetScanEnable::new(true, false)).await.unwrap();
-        log::info!("ble scanning");
+        tlog!("ble scanning");
     };
 
     embassy_futures::join::join(read, setup).await;
@@ -145,11 +153,11 @@ async fn main(spawner: Spawner) {
 
     let delay = Duration::from_millis(250);
     loop {
-        log::info!("led on!");
+        tlog!("led on!");
         control.gpio_set(0, true).await;
         Timer::after(delay).await;
 
-        log::info!("led off!");
+        tlog!("led off!");
         control.gpio_set(0, false).await;
         Timer::after(delay).await;
     }
