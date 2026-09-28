@@ -11,17 +11,20 @@ use crate::runner::{BusType, SealedBus};
 
 /// Custom Spi Trait that _only_ supports the bus operation of the cyw43
 /// Implementors are expected to hold the CS pin low during an operation.
+///
+/// The driver configures the device without `STATUS_ENABLE`, so it does not
+/// append a status word to transfers and implementations must not clock one.
 pub trait SpiBusCyw43 {
     /// Issues a write command on the bus
     /// First 32 bits of `word` are expected to be a cmd word
-    async fn cmd_write(&mut self, write: &[u32]) -> u32;
+    async fn cmd_write(&mut self, write: &[u32]);
 
     /// Issues a read command on the bus
     /// `write` is expected to be a 32 bit cmd word
     /// `read` will contain the response of the device
     /// Backplane reads have a response delay that produces one extra unspecified word at the beginning of `read`.
     /// Callers that want to read `n` word from the backplane, have to provide a slice that is `n+1` words long.
-    async fn cmd_read(&mut self, write: u32, read: &mut [u32]) -> u32;
+    async fn cmd_read(&mut self, write: u32, read: &mut [u32]);
 
     /// Wait for events from the Device. A typical implementation would wait for the IRQ pin to be high.
     /// The default implementation always reports ready, resulting in active polling of the device.
@@ -45,7 +48,6 @@ pub struct SpiBus<PWR, SPI> {
     backplane_window: u32,
     pwr: PWR,
     spi: SPI,
-    status: u32,
 }
 
 impl<PWR, SPI> SpiBus<PWR, SPI>
@@ -58,7 +60,6 @@ where
             backplane_window: 0xAAAA_AAAA,
             pwr,
             spi,
-            status: 0,
         }
     }
 
@@ -127,7 +128,7 @@ where
         // if we are reading from the backplane, we need an extra word for the response delay
         let len = if func == FUNC_BACKPLANE { 2 } else { 1 };
 
-        self.status = self.spi.cmd_read(cmd, &mut buf[..len]).await;
+        self.spi.cmd_read(cmd, &mut buf[..len]).await;
 
         // if we read from the backplane, the result is in the second word, after the response delay
         if func == FUNC_BACKPLANE { buf[1] } else { buf[0] }
@@ -136,7 +137,7 @@ where
     async fn writen(&mut self, func: u8, addr: u32, val: u32, len: u32) {
         let cmd = cmd_word(WRITE, INC_ADDR, func, addr, len);
 
-        self.status = self.spi.cmd_write(&[cmd, val]).await;
+        self.spi.cmd_write(&[cmd, val]).await;
     }
 
     async fn read32_swapped(&mut self, func: u8, addr: u32) -> u32 {
@@ -144,7 +145,7 @@ where
         let cmd = swap16(cmd);
         let mut buf = [0; 1];
 
-        self.status = self.spi.cmd_read(cmd, &mut buf).await;
+        self.spi.cmd_read(cmd, &mut buf).await;
 
         swap16(buf[0])
     }
@@ -153,7 +154,7 @@ where
         let cmd = cmd_word(WRITE, INC_ADDR, func, addr, 4);
         let buf = [swap16(cmd), swap16(val)];
 
-        self.status = self.spi.cmd_write(&buf).await;
+        self.spi.cmd_write(&buf).await;
     }
 }
 
@@ -205,7 +206,6 @@ where
                 | INTERRUPT_POLARITY_HIGH
                 | WAKE_UP
                 | 0x4 << (8 * REG_BUS_RESPONSE_DELAY)
-                | STATUS_ENABLE << (8 * REG_BUS_STATUS_ENABLE)
                 | INTR_WITH_STATUS << (8 * REG_BUS_STATUS_ENABLE),
         )
         .await;
@@ -264,7 +264,7 @@ where
         let cmd = cmd_word(READ, INC_ADDR, FUNC_WLAN, 0, len_in_u8);
         let len_in_u32 = (len_in_u8 as usize).div_ceil(4);
 
-        self.status = self.spi.cmd_read(cmd, &mut buf[..len_in_u32]).await;
+        self.spi.cmd_read(cmd, &mut buf[..len_in_u32]).await;
 
         Ok(())
     }
@@ -273,7 +273,7 @@ where
         let len = buf.len() - 4;
         buf[..4].copy_from_slice(&cmd_word(WRITE, INC_ADDR, FUNC_WLAN, 0, len as u32).to_le_bytes());
 
-        self.status = self.spi.cmd_write(slice32_ref(buf)).await;
+        self.spi.cmd_write(slice32_ref(buf)).await;
 
         Ok(())
     }
@@ -299,8 +299,7 @@ where
             let cmd = cmd_word(READ, INC_ADDR, FUNC_BACKPLANE, window_offs, len as u32);
 
             // round `buf` to word boundary, add one extra word for the response delay
-            self.status = self
-                .spi
+            self.spi
                 .cmd_read(cmd, &mut slice32_mut(buf)[..len.div_ceil(4) + 1])
                 .await;
 
@@ -337,7 +336,7 @@ where
             let cmd = cmd_word(WRITE, INC_ADDR, FUNC_BACKPLANE, window_offs, len as u32);
             slice32_mut(buf)[0] = cmd;
 
-            self.status = self.spi.cmd_write(&slice32_ref(buf)[..len.div_ceil(4) + 1]).await;
+            self.spi.cmd_write(&slice32_ref(buf)[..len.div_ceil(4) + 1]).await;
 
             // Advance ptr.
             addr += len as u32;
@@ -391,14 +390,7 @@ where
     }
 
     async fn read32(&mut self, func: u8, addr: u32) -> u32 {
-        if func == FUNC_BUS && addr == SPI_STATUS_REGISTER && self.status != 0 {
-            let status = self.status;
-            self.status = 0;
-
-            status
-        } else {
-            self.readn(func, addr, 4).await
-        }
+        self.readn(func, addr, 4).await
     }
 
     #[allow(unused)]
