@@ -63,6 +63,17 @@ async fn net_task(mut runner: embassy_net::Runner<'static>) -> ! {
     runner.run().await
 }
 
+/// Logs without touching the chip: if this keeps going after the LED lines
+/// stop, the executor is alive and the bus is wedged; if it stops too, the
+/// core has halted (a panic, most likely).
+#[embassy_executor::task]
+async fn heartbeat_task() {
+    loop {
+        Timer::after_secs(10).await;
+        tlog!("alive");
+    }
+}
+
 #[embassy_executor::task]
 async fn logger_task(driver: usb::Driver<'static, USB>) {
     embassy_usb_logger::run!(1024, log::LevelFilter::Info, driver);
@@ -126,6 +137,7 @@ async fn cyw43_task(
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
     spawner.spawn(unwrap!(logger_task(usb::Driver::new(p.USB, Irqs))));
+    spawner.spawn(unwrap!(heartbeat_task()));
     let fw = aligned_bytes!("../../../../cyw43-firmware/43439A0.bin");
     let clm = aligned_bytes!("../../../../cyw43-firmware/43439A0_clm.bin");
     let nvram = aligned_bytes!("../../../../cyw43-firmware/nvram_rp2040.bin");
