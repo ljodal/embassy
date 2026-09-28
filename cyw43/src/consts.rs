@@ -26,6 +26,7 @@ pub(crate) const INTERRUPT_POLARITY_HIGH: u32 = 0x20;
 pub(crate) const WAKE_UP: u32 = 0x80;
 
 // SPI_STATUS_ENABLE bits
+#[allow(unused)]
 pub(crate) const STATUS_ENABLE: u32 = 0x01;
 pub(crate) const INTR_WITH_STATUS: u32 = 0x02;
 pub(crate) const RESP_DELAY_ALL: u32 = 0x04;
