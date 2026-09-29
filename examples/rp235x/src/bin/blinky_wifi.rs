@@ -13,9 +13,9 @@ use embassy_executor::Spawner;
 use embassy_net::StackStorage;
 use embassy_rp::clocks::RoscRng;
 use embassy_rp::gpio::{Level, Output};
-use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, PIO0, USB};
+use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, PIO0};
 use embassy_rp::pio::{InterruptHandler, Pio};
-use embassy_rp::{bind_interrupts, dma, usb};
+use embassy_rp::{bind_interrupts, dma};
 use embassy_time::{Duration, Timer};
 use panic_probe as _;
 use static_cell::StaticCell;
@@ -37,16 +37,7 @@ pub static PICOTOOL_ENTRIES: [embassy_rp::binary_info::EntryAddr; 4] = [
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => InterruptHandler<PIO0>;
     DMA_IRQ_0 => dma::InterruptHandler<DMA_CH0>, dma::InterruptHandler<DMA_CH1>;
-    USBCTRL_IRQ => usb::InterruptHandler<USB>;
 });
-
-/// `log::info!` with seconds since boot in front, for the USB log.
-macro_rules! tlog {
-    ($($arg:tt)*) => {{
-        let ms = embassy_time::Instant::now().as_millis();
-        log::info!("[{}.{:03}] {}", ms / 1000, ms % 1000, format_args!($($arg)*));
-    }};
-}
 
 // Set at build time: `WIFI_NETWORK=ssid WIFI_PASSWORD=pwd cargo build ...`
 const WIFI_NETWORK: &str = match option_env!("WIFI_NETWORK") {
@@ -70,13 +61,8 @@ async fn net_task(mut runner: embassy_net::Runner<'static>) -> ! {
 async fn heartbeat_task() {
     loop {
         Timer::after_secs(10).await;
-        tlog!("alive");
+        info!("alive");
     }
-}
-
-#[embassy_executor::task]
-async fn logger_task(driver: usb::Driver<'static, USB>) {
-    embassy_usb_logger::run!(1024, log::LevelFilter::Info, driver);
 }
 
 #[embassy_executor::task]
@@ -96,7 +82,7 @@ async fn ble_task(bt_device: cyw43::bluetooth::BtDriver<'static>) {
             let _ = controller.read(&mut buf).await;
             events += 1;
             if events % 100 == 0 {
-                tlog!("{} ble events", events);
+                info!("{} ble events", events);
             }
         }
     };
@@ -120,7 +106,7 @@ async fn ble_task(bt_device: cyw43::bluetooth::BtDriver<'static>) {
             .await
             .unwrap();
         controller.exec(&LeSetScanEnable::new(true, false)).await.unwrap();
-        tlog!("ble scanning");
+        info!("ble scanning");
     };
 
     embassy_futures::join::join(read, setup).await;
@@ -136,7 +122,6 @@ async fn cyw43_task(
 #[embassy_executor::main(executor = "embassy_rp::executor::Executor", entry = "cortex_m_rt::entry")]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
-    spawner.spawn(unwrap!(logger_task(usb::Driver::new(p.USB, Irqs))));
     spawner.spawn(unwrap!(heartbeat_task()));
     let fw = aligned_bytes!("../../../../cyw43-firmware/43439A0.bin");
     let clm = aligned_bytes!("../../../../cyw43-firmware/43439A0_clm.bin");
@@ -191,18 +176,18 @@ async fn main(spawner: Spawner) {
         .join(WIFI_NETWORK, JoinOptions::new(WIFI_PASSWORD.as_bytes()))
         .await
     {
-        tlog!("join failed: {:?}", err);
+        info!("join failed: {:?}", err);
     }
     iface.wait_config_up().await;
-    tlog!("wifi up: {:?}", iface.ip_addrs());
+    info!("wifi up: {:?}", iface.ip_addrs());
 
     let delay = Duration::from_millis(250);
     loop {
-        tlog!("led on!");
+        info!("led on!");
         control.gpio_set(0, true).await;
         Timer::after(delay).await;
 
-        tlog!("led off!");
+        info!("led off!");
         control.gpio_set(0, false).await;
         Timer::after(delay).await;
     }
