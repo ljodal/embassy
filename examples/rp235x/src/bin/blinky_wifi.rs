@@ -7,7 +7,7 @@
 
 use cyw43::{JoinOptions, aligned_bytes};
 use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
-use defmt::unwrap;
+use defmt::*;
 use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_net::StackStorage;
@@ -15,9 +15,9 @@ use embassy_rp::clocks::RoscRng;
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, PIO0, USB};
 use embassy_rp::pio::{InterruptHandler, Pio};
-use embassy_rp::watchdog::{ResetReason, Watchdog};
 use embassy_rp::{bind_interrupts, dma, usb};
 use embassy_time::{Duration, Timer};
+use panic_probe as _;
 use static_cell::StaticCell;
 
 // Program metadata for `picotool info`.
@@ -64,81 +64,13 @@ async fn net_task(mut runner: embassy_net::Runner<'static>) -> ! {
 }
 
 /// Logs without touching the chip: if this keeps going after the LED lines
-/// stop, the executor is alive and the bus is wedged. A panic reboots (see
-/// `panic`), and the next boot reports it here.
+/// stop, the executor is alive and the bus is wedged; if it stops too, the
+/// core has halted (a panic, most likely).
 #[embassy_executor::task]
-async fn heartbeat_task(last_reset: LastReset) {
+async fn heartbeat_task() {
     loop {
         Timer::after_secs(10).await;
-        tlog!("alive, last reset: {}", last_reset);
-    }
-}
-
-// Panic record, kept in watchdog scratch registers across the reset.
-const PANIC_MAGIC: u32 = 0x7061_6e69; // "pani"
-const SCRATCH_MAGIC: usize = 0;
-const SCRATCH_LINE: usize = 1;
-const SCRATCH_FILE_PTR: usize = 2;
-const SCRATCH_FILE_LEN: usize = 3;
-const SCRATCH_UPTIME: usize = 4;
-
-/// Record where the panic happened and reset through the watchdog, so the
-/// next boot can say. The message itself would need defmt, and a probe.
-#[panic_handler]
-fn panic(info: &core::panic::PanicInfo) -> ! {
-    let mut watchdog = Watchdog::new(unsafe { embassy_rp::peripherals::WATCHDOG::steal() });
-    let (file, line) = info.location().map_or(("", 0), |l| (l.file(), l.line()));
-    watchdog.set_scratch(SCRATCH_LINE, line);
-    watchdog.set_scratch(SCRATCH_FILE_PTR, file.as_ptr() as u32);
-    watchdog.set_scratch(SCRATCH_FILE_LEN, file.len() as u32);
-    watchdog.set_scratch(SCRATCH_UPTIME, embassy_time::Instant::now().as_secs() as u32);
-    watchdog.set_scratch(SCRATCH_MAGIC, PANIC_MAGIC);
-    watchdog.trigger_reset();
-    loop {
-        core::hint::spin_loop();
-    }
-}
-
-#[derive(Clone, Copy)]
-enum LastReset {
-    Panic { file: &'static str, line: u32, after: u32 },
-    Watchdog(Option<ResetReason>),
-}
-
-impl LastReset {
-    /// Read and clear the panic record, if the previous run left one.
-    fn take(watchdog: &mut Watchdog) -> Self {
-        let panicked = watchdog.scratch(SCRATCH_MAGIC) == PANIC_MAGIC;
-        watchdog.set_scratch(SCRATCH_MAGIC, 0);
-        if !panicked {
-            return Self::Watchdog(watchdog.reset_reason());
-        }
-
-        // Only trust the file pointer if it points into flash.
-        let ptr = watchdog.scratch(SCRATCH_FILE_PTR) as usize;
-        let len = watchdog.scratch(SCRATCH_FILE_LEN) as usize;
-        let file = if (0x1000_0000..0x1100_0000).contains(&ptr) && len <= 128 {
-            let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
-            core::str::from_utf8(bytes).unwrap_or("?")
-        } else {
-            "?"
-        };
-        Self::Panic {
-            file,
-            line: watchdog.scratch(SCRATCH_LINE),
-            after: watchdog.scratch(SCRATCH_UPTIME),
-        }
-    }
-}
-
-impl core::fmt::Display for LastReset {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Panic { file, line, after } => write!(f, "panicked at {}:{} after {}s", file, line, after),
-            // A flash with `picotool -x` also reboots through the watchdog.
-            Self::Watchdog(Some(reason)) => write!(f, "watchdog ({:?})", reason),
-            Self::Watchdog(None) => write!(f, "power-on"),
-        }
+        tlog!("alive");
     }
 }
 
@@ -205,8 +137,7 @@ async fn cyw43_task(
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
     spawner.spawn(unwrap!(logger_task(usb::Driver::new(p.USB, Irqs))));
-    let last_reset = LastReset::take(&mut Watchdog::new(p.WATCHDOG));
-    spawner.spawn(unwrap!(heartbeat_task(last_reset)));
+    spawner.spawn(unwrap!(heartbeat_task()));
     let fw = aligned_bytes!("../../../../cyw43-firmware/43439A0.bin");
     let clm = aligned_bytes!("../../../../cyw43-firmware/43439A0_clm.bin");
     let nvram = aligned_bytes!("../../../../cyw43-firmware/nvram_rp2040.bin");
