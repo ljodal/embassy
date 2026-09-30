@@ -41,6 +41,18 @@ impl Default for LogState {
     }
 }
 
+/// DIAGNOSTIC: snapshot of the bus after a read returned data that cannot be
+/// right. Status and interrupt come from F0, which needs no backplane; the chip
+/// ID is a backplane read at a fixed address with a known answer (0xa9af for a
+/// CYW43439), so it shows whether the backplane is serving reads at all.
+#[allow(unused)]
+pub(crate) async fn diag_bus_state(bus: &mut impl Bus) -> (u32, u16, u16) {
+    let status = bus.read32(FUNC_BUS, SPI_STATUS_REGISTER).await;
+    let irq = bus.read16(FUNC_BUS, REG_BUS_INTERRUPT).await;
+    let chip_id = bus.bp_read16(CHIPCOMMON_BASE_ADDRESS).await;
+    (status, irq, chip_id)
+}
+
 pub(crate) enum BusType {
     Spi,
     Sdio,
@@ -726,6 +738,30 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
         let mut log: Aligned<A4, [u8; _]> = Aligned([0; SharedMemLog::SIZE]);
         let _ = self.bus.bp_read(self.log.addr, &mut log[..], buf).await;
         let log = SharedMemLog::from_bytes(&log);
+
+        // DIAGNOSTIC: `log.buf` goes to `bp_read`, which asserts it is 4-aligned.
+        // Before that fires, record the chip's view of the bus and read the
+        // struct again, to tell a late read from a wedged backplane.
+        if log.buf % 4 != 0 {
+            let (status, irq, chip_id) = diag_bus_state(&mut self.bus).await;
+            let mut again: Aligned<A4, [u8; _]> = Aligned([0; SharedMemLog::SIZE]);
+            let _ = self.bus.bp_read(self.log.addr, &mut again[..], buf).await;
+            let (status2, irq2, chip_id2) = diag_bus_state(&mut self.bus).await;
+            warn!(
+                "bad log struct at {:08x}: buf={:08x} size={:08x} idx={:08x} | status={:08x} irq={:04x} chip={:04x} | re-read {:02x} | status={:08x} irq={:04x} chip={:04x}",
+                self.log.addr,
+                log.buf,
+                log.buf_size,
+                log.idx,
+                status,
+                irq,
+                chip_id,
+                Bytes(&again[..]),
+                status2,
+                irq2,
+                chip_id2
+            );
+        }
 
         let idx = log.idx as usize;
 

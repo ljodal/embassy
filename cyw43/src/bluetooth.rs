@@ -12,7 +12,8 @@ use embassy_time::{Duration, Timer};
 use embedded_io_async::ErrorKind;
 
 use crate::consts::*;
-use crate::runner::Bus;
+use crate::fmt::Bytes;
+use crate::runner::{Bus, diag_bus_state};
 pub use crate::spi::SpiBusCyw43;
 use crate::util::round_up;
 use crate::{ChipInfo, Cyw43439, SealedChip, util};
@@ -476,7 +477,30 @@ impl<'a> BtRunner<'a> {
                 let len = header[0] as u32 | ((header[1]) as u32) << 8 | ((header[2]) as u32) << 16;
                 let rounded_len = round_up(len, 4);
                 if available < 4 + rounded_len {
-                    warn!("ringbuf data not enough for a full packet?");
+                    // DIAGNOSTIC: record the chip's view of the bus, then repeat
+                    // the header and write-pointer reads, to tell a late read
+                    // from a wedged backplane.
+                    let (status, irq, chip_id) = diag_bus_state(bus).await;
+                    let mut again = [0u8; 4];
+                    let _ = bus.bp_read(addr, &mut again, buf).await;
+                    let wp_again = bus.bp_read32(self.addr + BTSDIO_OFFSET_BT2HOST_IN).await;
+                    let (status2, irq2, chip_id2) = diag_bus_state(bus).await;
+                    warn!(
+                        "ringbuf data not enough for a full packet? header={:02x} at {:08x} wp={:08x} rp={:08x} available={} | status={:08x} irq={:04x} chip={:04x} | re-read header={:02x} wp={:08x} | status={:08x} irq={:04x} chip={:04x}",
+                        Bytes(&header),
+                        addr,
+                        write_pointer,
+                        self.b2h_read_pointer,
+                        available,
+                        status,
+                        irq,
+                        chip_id,
+                        Bytes(&again),
+                        wp_again,
+                        status2,
+                        irq2,
+                        chip_id2
+                    );
                     break;
                 }
                 self.b2h_read_pointer = (self.b2h_read_pointer + 4) % BTSDIO_FWBUF_SIZE;
