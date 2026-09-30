@@ -969,8 +969,14 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
                 }
 
                 if irq & IRQ_DATA_UNAVAILABLE != 0 {
-                    // this seems to be ignorable with no ill effects.
-                    trace!("IRQ DATA_UNAVAILABLE, clearing...");
+                    // DIAGNOSTIC: count reads the device could not serve. The bit
+                    // latches until cleared, so this is a lower bound: several
+                    // unserved reads between two checks count once.
+                    static DATA_UNAVAILABLE_COUNT: core::sync::atomic::AtomicU32 =
+                        core::sync::atomic::AtomicU32::new(0);
+                    let n = DATA_UNAVAILABLE_COUNT.load(core::sync::atomic::Ordering::Relaxed) + 1;
+                    DATA_UNAVAILABLE_COUNT.store(n, core::sync::atomic::Ordering::Relaxed);
+                    warn!("IRQ DATA_UNAVAILABLE #{}, clearing...", n);
                     self.bus.write16(FUNC_BUS, REG_BUS_INTERRUPT, 1).await;
                 }
 
