@@ -53,6 +53,58 @@ pub(crate) async fn diag_bus_state(bus: &mut impl Bus) -> (u32, u16, u16) {
     (status, irq, chip_id)
 }
 
+/// DIAGNOSTIC: once a backplane read has come back stale, find out what, if
+/// anything, brings the backplane back. Steps, each logged, stopping at the
+/// first that reads the right chip ID:
+/// 1. read the F1 clock and sleep CSRs (is the HT clock still up?)
+/// 2. clear the latched `DATA_UNAVAILABLE`, re-read the chip ID
+/// 3. the same after waiting 1, 10, 100 and 1000 ms
+/// 4. re-request the HT clock, wait for it, clear, re-read
+///
+/// Returns whether the backplane answered correctly in the end.
+#[allow(unused)]
+pub(crate) async fn diag_recover(bus: &mut impl Bus) -> bool {
+    let clock_csr = bus.read8(FUNC_BACKPLANE, REG_BACKPLANE_CHIP_CLOCK_CSR).await;
+    let sleep_csr = bus.read8(FUNC_BACKPLANE, REG_BACKPLANE_SLEEP_CSR).await;
+    warn!("diag: clock_csr={:02x} sleep_csr={:02x}", clock_csr, sleep_csr);
+
+    for wait_ms in [0u64, 1, 10, 100, 1000] {
+        if wait_ms != 0 {
+            embassy_time::Timer::after(Duration::from_millis(wait_ms)).await;
+        }
+        bus.write16(FUNC_BUS, REG_BUS_INTERRUPT, IRQ_DATA_UNAVAILABLE).await;
+        let chip_id = bus.bp_read16(CHIPCOMMON_BASE_ADDRESS).await;
+        let irq = bus.read16(FUNC_BUS, REG_BUS_INTERRUPT).await;
+        let status = bus.read32(FUNC_BUS, SPI_STATUS_REGISTER).await;
+        warn!(
+            "diag: cleared, waited {}ms: chip={:04x} irq={:04x} status={:08x}",
+            wait_ms, chip_id, irq, status
+        );
+        if chip_id == 43439 {
+            return true;
+        }
+    }
+
+    bus.write8(FUNC_BACKPLANE, REG_BACKPLANE_CHIP_CLOCK_CSR, BACKPLANE_HT_AVAIL_REQ)
+        .await;
+    let mut clock_csr = 0;
+    for _ in 0..100 {
+        clock_csr = bus.read8(FUNC_BACKPLANE, REG_BACKPLANE_CHIP_CLOCK_CSR).await;
+        if clock_csr & 0x80 != 0 {
+            break;
+        }
+        embassy_time::Timer::after(Duration::from_millis(1)).await;
+    }
+    bus.write16(FUNC_BUS, REG_BUS_INTERRUPT, IRQ_DATA_UNAVAILABLE).await;
+    let chip_id = bus.bp_read16(CHIPCOMMON_BASE_ADDRESS).await;
+    let irq = bus.read16(FUNC_BUS, REG_BUS_INTERRUPT).await;
+    warn!(
+        "diag: HT re-requested: clock_csr={:02x} chip={:04x} irq={:04x}",
+        clock_csr, chip_id, irq
+    );
+    chip_id == 43439
+}
+
 pub(crate) enum BusType {
     Spi,
     Sdio,
@@ -761,6 +813,11 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
                 irq2,
                 chip_id2
             );
+            if !diag_recover(&mut self.bus).await {
+                panic!("diag: backplane did not recover");
+            }
+            warn!("diag: backplane recovered, skipping this log read");
+            return;
         }
 
         let idx = log.idx as usize;

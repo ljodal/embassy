@@ -13,7 +13,7 @@ use embedded_io_async::ErrorKind;
 
 use crate::consts::*;
 use crate::fmt::Bytes;
-use crate::runner::{Bus, diag_bus_state};
+use crate::runner::{Bus, diag_bus_state, diag_recover};
 pub use crate::spi::SpiBusCyw43;
 use crate::util::round_up;
 use crate::{ChipInfo, Cyw43439, SealedChip, util};
@@ -501,6 +501,10 @@ impl<'a> BtRunner<'a> {
                         irq2,
                         chip_id2
                     );
+                    if !diag_recover(bus).await {
+                        panic!("diag: backplane did not recover");
+                    }
+                    warn!("diag: backplane recovered, dropping this ring read");
                     break;
                 }
                 self.b2h_read_pointer = (self.b2h_read_pointer + 4) % BTSDIO_FWBUF_SIZE;
