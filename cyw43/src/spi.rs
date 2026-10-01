@@ -43,6 +43,81 @@ const fn slice32_ref(x: &Aligned<A4, [u8]>) -> &[u32] {
     unsafe { slice::from_raw_parts(x as *const Aligned<A4, [u8]> as *const u32, len) }
 }
 
+// DIAGNOSTIC: a RAM ring of the last `TRACE_LEN` bus operations, dumped once
+// when a backplane read is seen to return impossible data, so the log shows
+// what led up to it. Five words per entry: kind/func/len, address, first data
+// word, backplane window, time in us. Atomics so no `unsafe`; only the runner
+// touches it, so load + store is enough (no `fetch_add` on thumbv6m).
+mod diag_trace {
+    use core::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
+
+    pub(crate) const READ: u32 = 1;
+    pub(crate) const WRITE: u32 = 2;
+    pub(crate) const BP_READ: u32 = 3;
+    pub(crate) const BP_WRITE: u32 = 4;
+    pub(crate) const WLAN_READ: u32 = 5;
+    pub(crate) const WLAN_WRITE: u32 = 6;
+
+    const TRACE_LEN: usize = 64;
+    const WORDS: usize = 5;
+    static TRACE: [AtomicU32; TRACE_LEN * WORDS] = [const { AtomicU32::new(0) }; TRACE_LEN * WORDS];
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    static FROZEN: AtomicBool = AtomicBool::new(false);
+
+    pub(crate) fn record(kind: u32, func: u8, addr: u32, len: usize, val: u32, window: u32) {
+        if FROZEN.load(Relaxed) {
+            return;
+        }
+        let n = NEXT.load(Relaxed);
+        NEXT.store(n.wrapping_add(1), Relaxed);
+        let e = (n as usize % TRACE_LEN) * WORDS;
+        TRACE[e].store(kind << 28 | (func as u32) << 24 | (len as u32 & 0xFFFF), Relaxed);
+        TRACE[e + 1].store(addr, Relaxed);
+        TRACE[e + 2].store(val, Relaxed);
+        TRACE[e + 3].store(window, Relaxed);
+        TRACE[e + 4].store(embassy_time::Instant::now().as_micros() as u32, Relaxed);
+    }
+
+    /// Log the trace, oldest first, and stop recording. Only the first call logs.
+    #[allow(unused)]
+    pub(crate) fn dump() {
+        if FROZEN.load(Relaxed) {
+            return;
+        }
+        FROZEN.store(true, Relaxed);
+        let n = NEXT.load(Relaxed);
+        let count = (n as usize).min(TRACE_LEN);
+        for i in 0..count {
+            let seq = n.wrapping_sub((count - i) as u32);
+            let e = (seq as usize % TRACE_LEN) * WORDS;
+            let meta = TRACE[e].load(Relaxed);
+            let kind = match meta >> 28 {
+                READ => "read",
+                WRITE => "write",
+                BP_READ => "bp_read",
+                BP_WRITE => "bp_write",
+                WLAN_READ => "wlan_read",
+                WLAN_WRITE => "wlan_write",
+                _ => "?",
+            };
+            warn!(
+                "trace #{} t={}us {} f{} addr={:08x} len={} val={:08x} window={:08x}",
+                seq,
+                TRACE[e + 4].load(Relaxed),
+                kind,
+                (meta >> 24) & 0xF,
+                TRACE[e + 1].load(Relaxed),
+                meta & 0xFFFF,
+                TRACE[e + 2].load(Relaxed),
+                TRACE[e + 3].load(Relaxed)
+            );
+        }
+    }
+}
+
+#[allow(unused_imports)]
+pub(crate) use diag_trace::dump as diag_trace_dump;
+
 /// Doc
 pub struct SpiBus<PWR, SPI> {
     backplane_window: u32,
@@ -133,6 +208,7 @@ where
         };
 
         self.spi.cmd_read(cmd, &mut buf[..pad + 1]).await;
+        diag_trace::record(diag_trace::READ, func, addr, len as usize, buf[pad], self.backplane_window);
 
         // the result follows the response delay
         buf[pad]
@@ -142,6 +218,7 @@ where
         let cmd = cmd_word(WRITE, INC_ADDR, func, addr, len);
 
         self.spi.cmd_write(&[cmd, val]).await;
+        diag_trace::record(diag_trace::WRITE, func, addr, len as usize, val, self.backplane_window);
     }
 
     async fn read32_swapped(&mut self, func: u8, addr: u32) -> u32 {
@@ -269,6 +346,7 @@ where
         let len_in_u32 = (len_in_u8 as usize).div_ceil(4);
 
         self.spi.cmd_read(cmd, &mut buf[..len_in_u32]).await;
+        diag_trace::record(diag_trace::WLAN_READ, FUNC_WLAN, 0, len_in_u8 as usize, buf[0], self.backplane_window);
 
         Ok(())
     }
@@ -278,6 +356,7 @@ where
         buf[..4].copy_from_slice(&cmd_word(WRITE, INC_ADDR, FUNC_WLAN, 0, len as u32).to_le_bytes());
 
         self.spi.cmd_write(slice32_ref(buf)).await;
+        diag_trace::record(diag_trace::WLAN_WRITE, FUNC_WLAN, 0, len, slice32_ref(buf)[1], self.backplane_window);
 
         Ok(())
     }
@@ -312,6 +391,14 @@ where
 
             // when writing out the data, we skip the response delay
             data[..len].copy_from_slice(&buf[SPI_BACKPLANE_READ_PAD_LEN_BYTES as usize..][..len]);
+            diag_trace::record(
+                diag_trace::BP_READ,
+                FUNC_BACKPLANE,
+                addr,
+                len,
+                slice32_mut(buf)[SPI_BACKPLANE_READ_PAD_LEN_WORDS],
+                self.backplane_window,
+            );
 
             // Advance ptr.
             addr += len as u32;
@@ -344,6 +431,14 @@ where
             slice32_mut(buf)[0] = cmd;
 
             self.spi.cmd_write(&slice32_ref(buf)[..len.div_ceil(4) + 1]).await;
+            diag_trace::record(
+                diag_trace::BP_WRITE,
+                FUNC_BACKPLANE,
+                addr,
+                len,
+                slice32_ref(buf)[1],
+                self.backplane_window,
+            );
 
             // Advance ptr.
             addr += len as u32;

@@ -480,6 +480,7 @@ impl<'a> BtRunner<'a> {
                     // DIAGNOSTIC: record the chip's view of the bus, then repeat
                     // the header and write-pointer reads, to tell a late read
                     // from a wedged backplane.
+                    crate::spi::diag_trace_dump();
                     let (status, irq, chip_id) = diag_bus_state(bus).await;
                     let mut again = [0u8; 4];
                     let _ = bus.bp_read(addr, &mut again, buf).await;

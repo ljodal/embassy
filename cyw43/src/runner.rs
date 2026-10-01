@@ -795,6 +795,7 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
         // Before that fires, record the chip's view of the bus and read the
         // struct again, to tell a late read from a wedged backplane.
         if log.buf % 4 != 0 {
+            crate::spi::diag_trace_dump();
             let (status, irq, chip_id) = diag_bus_state(&mut self.bus).await;
             let mut again: Aligned<A4, [u8; _]> = Aligned([0; SharedMemLog::SIZE]);
             let _ = self.bus.bp_read(self.log.addr, &mut again[..], buf).await;
