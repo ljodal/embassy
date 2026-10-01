@@ -22,8 +22,8 @@ pub trait SpiBusCyw43 {
     /// Issues a read command on the bus
     /// `write` is expected to be a 32 bit cmd word
     /// `read` will contain the response of the device
-    /// Backplane reads have a response delay that produces one extra unspecified word at the beginning of `read`.
-    /// Callers that want to read `n` word from the backplane, have to provide a slice that is `n+1` words long.
+    /// Backplane reads have a response delay that produces extra unspecified words at the beginning of `read`.
+    /// Callers that want to read `n` words from the backplane provide a slice that is long enough for both.
     async fn cmd_read(&mut self, write: u32, read: &mut [u32]);
 
     /// Wait for events from the Device. A typical implementation would wait for the IRQ pin to be high.
@@ -124,14 +124,18 @@ where
 
     async fn readn(&mut self, func: u8, addr: u32, len: u32) -> u32 {
         let cmd = cmd_word(READ, INC_ADDR, func, addr, len);
-        let mut buf = [0; 2];
-        // if we are reading from the backplane, we need an extra word for the response delay
-        let len = if func == FUNC_BACKPLANE { 2 } else { 1 };
+        let mut buf = [0; SPI_BACKPLANE_READ_PAD_LEN_WORDS + 1];
+        // if we are reading from the backplane, we need extra words for the response delay
+        let pad = if func == FUNC_BACKPLANE {
+            SPI_BACKPLANE_READ_PAD_LEN_WORDS
+        } else {
+            0
+        };
 
-        self.spi.cmd_read(cmd, &mut buf[..len]).await;
+        self.spi.cmd_read(cmd, &mut buf[..pad + 1]).await;
 
-        // if we read from the backplane, the result is in the second word, after the response delay
-        if func == FUNC_BACKPLANE { buf[1] } else { buf[0] }
+        // the result follows the response delay
+        buf[pad]
     }
 
     async fn writen(&mut self, func: u8, addr: u32, val: u32, len: u32) {
@@ -227,7 +231,7 @@ where
         cmp(val, TEST_PATTERN).map_err(|_| crate::Error)?;
 
         trace!("write SPI_RESP_DELAY_F1 CYW43_BACKPLANE_READ_PAD_LEN_BYTES");
-        self.write8(FUNC_BUS, SPI_RESP_DELAY_F1, WHD_BUS_SPI_BACKPLANE_READ_PADD_SIZE)
+        self.write8(FUNC_BUS, SPI_RESP_DELAY_F1, SPI_BACKPLANE_READ_PAD_LEN_BYTES)
             .await;
 
         // TODO: Make sure error interrupt bits are clear?
@@ -298,13 +302,16 @@ where
 
             let cmd = cmd_word(READ, INC_ADDR, FUNC_BACKPLANE, window_offs, len as u32);
 
-            // round `buf` to word boundary, add one extra word for the response delay
+            // round `buf` to word boundary, add the response delay words
             self.spi
-                .cmd_read(cmd, &mut slice32_mut(buf)[..len.div_ceil(4) + 1])
+                .cmd_read(
+                    cmd,
+                    &mut slice32_mut(buf)[..SPI_BACKPLANE_READ_PAD_LEN_WORDS + len.div_ceil(4)],
+                )
                 .await;
 
-            // when writing out the data, we skip the response-delay byte
-            data[..len].copy_from_slice(&buf[4..][..len]);
+            // when writing out the data, we skip the response delay
+            data[..len].copy_from_slice(&buf[SPI_BACKPLANE_READ_PAD_LEN_BYTES as usize..][..len]);
 
             // Advance ptr.
             addr += len as u32;
