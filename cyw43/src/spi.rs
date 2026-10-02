@@ -68,10 +68,9 @@ where
 
         self.backplane_set_window(addr).await;
 
-        let mut bus_addr = addr & BACKPLANE_ADDRESS_MASK;
-        if len == 4 {
-            bus_addr |= BACKPLANE_ADDRESS_32BIT_FLAG;
-        }
+        // On gSPI the 32-bit access flag goes on every backplane access, whatever
+        // its length, as in cyw43-driver (georgerobotics/cyw43-driver#77).
+        let bus_addr = (addr & BACKPLANE_ADDRESS_MASK) | BACKPLANE_ADDRESS_32BIT_FLAG;
 
         let val = self.readn(FUNC_BACKPLANE, bus_addr, len).await;
 
@@ -85,10 +84,7 @@ where
 
         self.backplane_set_window(addr).await;
 
-        let mut bus_addr = addr & BACKPLANE_ADDRESS_MASK;
-        if len == 4 {
-            bus_addr |= BACKPLANE_ADDRESS_32BIT_FLAG;
-        }
+        let bus_addr = (addr & BACKPLANE_ADDRESS_MASK) | BACKPLANE_ADDRESS_32BIT_FLAG;
         self.writen(FUNC_BACKPLANE, bus_addr, val, len).await;
     }
 
@@ -300,7 +296,13 @@ where
 
             self.backplane_set_window(addr).await;
 
-            let cmd = cmd_word(READ, INC_ADDR, FUNC_BACKPLANE, window_offs, len as u32);
+            let cmd = cmd_word(
+                READ,
+                INC_ADDR,
+                FUNC_BACKPLANE,
+                window_offs | BACKPLANE_ADDRESS_32BIT_FLAG,
+                len as u32,
+            );
 
             // round `buf` to word boundary, add the response delay words
             self.spi
@@ -340,7 +342,13 @@ where
 
             self.backplane_set_window(addr).await;
 
-            let cmd = cmd_word(WRITE, INC_ADDR, FUNC_BACKPLANE, window_offs, len as u32);
+            let cmd = cmd_word(
+                WRITE,
+                INC_ADDR,
+                FUNC_BACKPLANE,
+                window_offs | BACKPLANE_ADDRESS_32BIT_FLAG,
+                len as u32,
+            );
             slice32_mut(buf)[0] = cmd;
 
             self.spi.cmd_write(&slice32_ref(buf)[..len.div_ceil(4) + 1]).await;
