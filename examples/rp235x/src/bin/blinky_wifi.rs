@@ -6,7 +6,7 @@
 #![no_main]
 
 use cyw43::{JoinOptions, aligned_bytes};
-use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
+use cyw43_pio::{DEFAULT_CLOCK_DIVIDER, PioSpi};
 use defmt::*;
 use defmt_rtt as _;
 use embassy_executor::Spawner;
@@ -141,9 +141,9 @@ async fn main(spawner: Spawner) {
     let spi = PioSpi::new(
         &mut pio.common,
         pio.sm0,
-        // SPI communication won't work if the speed is too high, so we use a divider larger than `DEFAULT_CLOCK_DIVIDER`.
-        // See: https://github.com/embassy-rs/embassy/issues/3960.
-        RM2_CLOCK_DIVIDER,
+        // The pico-sdk's default clock (37.5 MHz from 150 MHz) and PIO program. Upstream uses
+        // `RM2_CLOCK_DIVIDER` here, see https://github.com/embassy-rs/embassy/issues/3960.
+        DEFAULT_CLOCK_DIVIDER,
         pio.irq0,
         cs,
         p.PIN_24,
