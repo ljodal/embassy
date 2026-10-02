@@ -5,11 +5,13 @@
 #![no_std]
 #![no_main]
 
-use cyw43::aligned_bytes;
+use cyw43::{JoinOptions, aligned_bytes};
 use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
 use defmt::*;
 use defmt_rtt as _;
 use embassy_executor::Spawner;
+use embassy_net::StackStorage;
+use embassy_rp::clocks::RoscRng;
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, PIO0};
 use embassy_rp::pio::{InterruptHandler, Pio};
@@ -37,6 +39,79 @@ bind_interrupts!(struct Irqs {
     DMA_IRQ_0 => dma::InterruptHandler<DMA_CH0>, dma::InterruptHandler<DMA_CH1>;
 });
 
+// Set at build time: `WIFI_NETWORK=ssid WIFI_PASSWORD=pwd cargo build ...`
+const WIFI_NETWORK: &str = match option_env!("WIFI_NETWORK") {
+    Some(s) => s,
+    None => "ssid",
+};
+const WIFI_PASSWORD: &str = match option_env!("WIFI_PASSWORD") {
+    Some(s) => s,
+    None => "pwd",
+};
+
+#[embassy_executor::task]
+async fn net_task(mut runner: embassy_net::Runner<'static>) -> ! {
+    runner.run().await
+}
+
+/// Logs without touching the chip: if this keeps going after the LED lines
+/// stop, the executor is alive and the bus is wedged; if it stops too, the
+/// core has halted (a panic, most likely).
+#[embassy_executor::task]
+async fn heartbeat_task() {
+    loop {
+        Timer::after_secs(10).await;
+        info!("alive");
+    }
+}
+
+#[embassy_executor::task]
+async fn ble_task(bt_device: cyw43::bluetooth::BtDriver<'static>) {
+    use bt_hci::cmd::controller_baseband::{Reset, SetEventMask};
+    use bt_hci::cmd::le::{LeSetEventMask, LeSetScanEnable, LeSetScanParams};
+    use bt_hci::controller::{Controller, ControllerCmdSync, ExternalController};
+    use bt_hci::param::{AddrKind, EventMask, LeEventMask, LeScanKind, ScanningFilterPolicy};
+
+    let controller: ExternalController<_, 4> = ExternalController::new(bt_device);
+
+    // Command responses arrive through `read`, so it runs alongside the setup.
+    let read = async {
+        let mut buf = controller.alloc_buf().unwrap();
+        let mut events = 0u32;
+        loop {
+            let _ = controller.read(&mut buf).await;
+            events += 1;
+            if events % 100 == 0 {
+                info!("{} ble events", events);
+            }
+        }
+    };
+
+    // Passive scan with duplicate filtering off, so advertising reports keep coming.
+    let setup = async {
+        controller.exec(&Reset::new()).await.unwrap();
+        let mask = EventMask::new().enable_le_meta(true);
+        controller.exec(&SetEventMask::new(mask)).await.unwrap();
+        let le_mask = LeEventMask::new().enable_le_adv_report(true);
+        controller.exec(&LeSetEventMask::new(le_mask)).await.unwrap();
+        let interval = bt_hci::param::Duration::from_millis(100);
+        controller
+            .exec(&LeSetScanParams::new(
+                LeScanKind::Passive,
+                interval,
+                interval,
+                AddrKind::PUBLIC,
+                ScanningFilterPolicy::BasicUnfiltered,
+            ))
+            .await
+            .unwrap();
+        controller.exec(&LeSetScanEnable::new(true, false)).await.unwrap();
+        info!("ble scanning");
+    };
+
+    embassy_futures::join::join(read, setup).await;
+}
+
 #[embassy_executor::task]
 async fn cyw43_task(
     runner: cyw43::Runner<'static, cyw43::SpiBus<Output<'static>, PioSpi<'static, PIO0, 0>>, cyw43::Cyw43439>,
@@ -47,9 +122,11 @@ async fn cyw43_task(
 #[embassy_executor::main(executor = "embassy_rp::executor::Executor", entry = "cortex_m_rt::entry")]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
+    spawner.spawn(unwrap!(heartbeat_task()));
     let fw = aligned_bytes!("../../../../cyw43-firmware/43439A0.bin");
     let clm = aligned_bytes!("../../../../cyw43-firmware/43439A0_clm.bin");
     let nvram = aligned_bytes!("../../../../cyw43-firmware/nvram_rp2040.bin");
+    let btfw = aligned_bytes!("../../../../cyw43-firmware/43439A0_btfw.bin");
 
     // To make flashing faster for development, you may want to flash the firmwares independently
     // at hardcoded addresses, instead of baking them into the program with `include_bytes!`:
@@ -77,13 +154,32 @@ async fn main(spawner: Spawner) {
 
     static STATE: StaticCell<cyw43::State> = StaticCell::new();
     let state = STATE.init(cyw43::State::new());
-    let (_net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw, nvram).await;
+    let (net_device, bt_device, mut control, runner) =
+        cyw43::new_with_bluetooth(state, pwr, spi, fw, btfw, nvram).await;
     spawner.spawn(unwrap!(cyw43_task(runner)));
 
     control.init(clm).await;
     control
         .set_power_management(cyw43::PowerManagementMode::PowerSave)
         .await;
+
+    spawner.spawn(unwrap!(ble_task(bt_device)));
+
+    static STACK: StaticCell<StackStorage> = StaticCell::new();
+    let (stack, runner) = embassy_net::Stack::new(STACK.init(StackStorage::new()), RoscRng.next_u64());
+    static DEVICE: StaticCell<cyw43::NetDriver<'static>> = StaticCell::new();
+    let iface = unwrap!(stack.add_iface(DEVICE.init(net_device)));
+    unwrap!(iface.set_dhcpv4(Some(Default::default())));
+    spawner.spawn(unwrap!(net_task(runner)));
+
+    while let Err(err) = control
+        .join(WIFI_NETWORK, JoinOptions::new(WIFI_PASSWORD.as_bytes()))
+        .await
+    {
+        info!("join failed: {:?}", err);
+    }
+    iface.wait_config_up().await;
+    info!("wifi up: {:?}", iface.ip_addrs());
 
     let delay = Duration::from_millis(250);
     loop {
