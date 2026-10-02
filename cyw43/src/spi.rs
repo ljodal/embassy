@@ -73,6 +73,7 @@ where
         let bus_addr = (addr & BACKPLANE_ADDRESS_MASK) | BACKPLANE_ADDRESS_32BIT_FLAG;
 
         let val = self.readn(FUNC_BACKPLANE, bus_addr, len).await;
+        self.backplane_set_window(CHIPCOMMON_BASE_ADDRESS).await;
 
         trace!("backplane_readn addr = {:08x} len = {} val = {:08x}", addr, len, val);
 
@@ -86,6 +87,7 @@ where
 
         let bus_addr = (addr & BACKPLANE_ADDRESS_MASK) | BACKPLANE_ADDRESS_32BIT_FLAG;
         self.writen(FUNC_BACKPLANE, bus_addr, val, len).await;
+        self.backplane_set_window(CHIPCOMMON_BASE_ADDRESS).await;
     }
 
     async fn backplane_set_window(&mut self, addr: u32) {
@@ -320,6 +322,8 @@ where
             data = &mut data[len..];
         }
 
+        self.backplane_set_window(CHIPCOMMON_BASE_ADDRESS).await;
+
         Ok(())
     }
 
@@ -357,6 +361,8 @@ where
             addr += len as u32;
             data = &data[len..];
         }
+
+        self.backplane_set_window(CHIPCOMMON_BASE_ADDRESS).await;
 
         Ok(())
     }
